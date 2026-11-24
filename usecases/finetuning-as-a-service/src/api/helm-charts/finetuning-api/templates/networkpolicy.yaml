@@ -1,0 +1,119 @@
+{{- if .Values.networkPolicy.enabled }}
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: {{ include "finetuning-service.fullname" . }}
+  labels:
+    {{- include "finetuning-service.labels" . | nindent 4 }}
+spec:
+  podSelector:
+    matchLabels:
+      {{- include "finetuning-service.selectorLabels" . | nindent 6 }}
+  policyTypes:
+  - Ingress
+  - Egress
+
+  ingress:
+  # The platform gateway, and any extra callers configured
+  - from:
+    {{- with .Values.networkPolicy.ingress.gateway }}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .controllerNamespace }}
+      podSelector:
+        matchLabels:
+          app.kubernetes.io/name: envoy
+          app.kubernetes.io/component: proxy
+          gateway.envoyproxy.io/owning-gateway-name: {{ .name }}
+          gateway.envoyproxy.io/owning-gateway-namespace: {{ .namespace }}
+    {{- end }}
+    {{- if .Values.networkPolicy.ingress.fromNamespaces }}
+    {{- range .Values.networkPolicy.ingress.fromNamespaces }}
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ . }}
+    {{- end }}
+    {{- end }}
+    {{- if .Values.networkPolicy.ingress.fromPodLabels }}
+    - podSelector:
+        matchLabels:
+          {{- toYaml .Values.networkPolicy.ingress.fromPodLabels | nindent 10 }}
+    {{- end }}
+    ports:
+    - protocol: TCP
+      port: 8000
+    {{- if .Values.networkPolicy.ambientMesh }}
+    - protocol: TCP
+      port: 15008
+  # Istio ambient: kubelet probes are SNATed to this link-local address.
+  - from:
+    - ipBlock:
+        cidr: 169.254.7.127/32
+    {{- end }}
+
+  egress:
+  # PostgreSQL database
+  - to:
+    - podSelector:
+        matchLabels:
+          app: postgres
+    ports:
+    - protocol: TCP
+      port: 5432
+    {{- if .Values.networkPolicy.ambientMesh }}
+    # Istio ambient carries mesh traffic to the destination's ztunnel (HBONE).
+    - protocol: TCP
+      port: 15008
+    {{- end }}
+
+  # DNS resolution
+  - ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+
+  # External HTTPS/HTTP (external fine-tuning engine and its identity provider)
+  - ports:
+    - protocol: TCP
+      port: 443
+    - protocol: TCP
+      port: 80
+    - protocol: TCP
+      port: 8000
+    - protocol: TCP
+      port: 8080
+    - protocol: TCP
+      port: 8443
+    - protocol: TCP
+      port: 8444
+    {{- if .Values.networkPolicy.ambientMesh }}
+    - protocol: TCP
+      port: 15008
+    {{- end }}
+
+  # The Kubernetes API server, for the model deployments (helm and the
+  # status reads). Outside the pod network, so scoped by port only.
+  {{- with .Values.networkPolicy.egress.apiServerPorts }}
+  - ports:
+    {{- range . }}
+    - protocol: TCP
+      port: {{ . }}
+    {{- end }}
+  {{- end }}
+
+  # The LiteLLM gateway, for reading and updating model registrations --
+  # 4000 is not in the list above, so without this the gateway resolves but every
+  # connection to it times out.
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: {{ .Values.gateway.namespace }}
+    ports:
+    - protocol: TCP
+      port: {{ .Values.gateway.port }}
+    {{- if .Values.networkPolicy.ambientMesh }}
+    - protocol: TCP
+      port: 15008
+    {{- end }}
+{{- end }}

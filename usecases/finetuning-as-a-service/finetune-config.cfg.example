@@ -1,0 +1,153 @@
+---
+# Copyright (C) 2024-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# FineTuning-as-a-Service — operator configuration.
+#
+# Copy to finetune-config.cfg (gitignored) and fill in the blanks — do NOT commit
+# it. Read by playbooks/deploy-all.yml via include_vars, so it must be valid YAML
+# (key: value).
+#
+# Everything the platform provides (cluster domain, gateway
+# master key, Langfuse keys, TLS certificate) is read from the cluster, and every
+# password and client secret left blank here is generated on first install and
+# reused afterwards (kept in Secret finetuning-api/finetuning-as-a-service-secrets).
+#
+# With GPU nodes in this cluster nothing below needs
+# filling in. Only training
+# on a SEPARATE GPU cluster needs the "Separate GPU cluster" block.
+#
+# "nvidia_" is historical: those keys describe how the Fine-Tuning API reaches
+# the fine-tuning ENGINE, which by default is the engine this use case deploys
+# into the finetuning-engine namespace.
+#
+# Keep the values quoted — an unquoted empty key parses as null, which makes the
+# playbook's length check raise a Jinja error instead of its intended message.
+
+# ── Overrides for what is normally discovered ────────────────────────────────
+# Cluster host, e.g. "api.example.com". Blank: read from the platform gateway (eg-gateway, https-apex).
+cluster_url: ""
+
+# Registry images are built into and pulled from. Blank: the in-cluster registry
+# (registry.kube-system.svc.cluster.local:5000), which containerd on this node
+# is configured to trust on first run.
+finetune_registry: ""
+
+# Langfuse organisation keys for the Data Prep trace-import project list, as
+# "publicKey:secretKey" pairs separated by commas. Create one in Langfuse under
+# Organization settings -> API Keys. Blank: only the toolkit's default project.
+langfuse_org_keys: ""
+
+# Chat model on the platform's LiteLLM that writes Q&A pairs from documents
+# (Data Preparation page). Blank: the first one it serves that is not a model
+# fine-tuned here.
+finetune_qa_model: ""
+
+# ── Fine-Tuning Engine connection ────────────────────────────────────────────
+# URL of the fine-tuning engine. The in-cluster Service of the engine deployed by
+# playbooks/deploy-finetuning-engine.yml. No trailing slash.
+#
+# Point this at an external engine instead (e.g. "https://engine.example.com:8443")
+# only when not deploying the bundled one, and then set finetune_engine_enabled
+# to false so the two do not both claim the GPU cluster's quota.
+nvidia_finetune_backend_url: "http://finetuning-engine.finetuning-engine.svc.cluster.local:8000"
+
+# Keycloak token endpoint the API fetches an engine token from. Blank: the
+# platform realm through the in-cluster Service (pods cannot resolve the public
+# host). Set it only for an external engine with its own IdP.
+nvidia_keycloak_token_url: ""
+
+# OAuth2 client credentials the Fine-Tuning API uses against the engine. With the
+# shared Keycloak, deploy-keycloak.yml creates this client in the realm as a
+# service-account-only client (no browser flow) and the engine is configured to
+# accept exactly this client id as its token audience — so changing the id here
+# changes it in all three places.
+nvidia_keycloak_client_id: "finetuning-backend"
+# Blank: generated. Set it only for an external engine with its own IdP.
+nvidia_keycloak_client_secret: ""
+
+# Set to "false" if the engine / Keycloak use self-signed certificates.
+nvidia_keycloak_verify_ssl: "false"
+
+# Signs the per-job token a training pod uses to read its dataset from, and
+# upload the model to, the Files API (it has no browser session). Blank:
+# generated.
+files_job_token_secret: ""
+
+# ── Fine-Tuning Engine (training control plane) ──────────────────────────────
+# Deployed by playbooks/deploy-finetuning-engine.yml into its own namespace with
+# its own Postgres. It has no GPU: each request becomes one Kubernetes Job on a
+# GPU node.
+finetune_engine_enabled: true
+
+# Where those Jobs run:
+#   auto    - a separate GPU cluster when finetune_train_kubeconfig is set,
+#             otherwise this cluster when it has GPU nodes (the NVIDIA GPU
+#             Operator labels them nvidia.com/gpu.present=true).
+#             With neither, the deploy stops and says so.
+#   local   - this cluster, even before a GPU node has joined (Jobs wait).
+#   remote  - the separate GPU cluster below.
+finetune_train_mode: "auto"
+
+# Namespace the training Jobs are created in. Local: created by the deploy.
+# Remote: must already exist on the GPU cluster, with a GPU quota.
+finetune_train_namespace: "ftaas"
+
+# ReadWriteMany storage class, where training runs, for the work volume every
+# training Job shares (base-model cache, datasets). Blank: ceph-filesystem.
+finetune_train_pvc_storage_class: ""
+
+# Proxy the TRAINING POD uses to reach the Hugging Face Hub. Local: blank takes
+# the proxy of the shell running the deploy. Without a route out the base-model
+# download hangs rather than fails, until the job timeout.
+finetune_train_https_proxy: ""
+finetune_train_http_proxy: ""
+finetune_train_no_proxy: ""
+
+# ── Separate GPU cluster (remote training only) ──────────────────────────────
+# For testing, or when the GPUs are in another cluster. docs/deployment.md,
+# "Separate GPU cluster", lists what its administrator prepares.
+
+# Kubeconfig for the GPU cluster, on the machine running the deploy. Keep it mode
+# 0600 — it holds a bearer token. It is read from this path and put into a Secret;
+# it is never passed through --set, which would copy it into the Helm release
+# secret and the shell history.
+finetune_train_kubeconfig: ""
+
+# Address of THIS cluster's ingress, as reachable from the GPU cluster. The
+# training pod resolves cluster_url to it locally (like an /etc/hosts entry), so
+# the hostname stays in the URL and host-based routing plus certificate
+# verification still work. Without it the pod cannot find the Files API at all:
+# the GPU cluster's DNS has no record for this cluster's hostname.
+finetune_files_api_ip: ""
+
+# "true", "false", or a path to a CA bundle inside the training image. False while
+# the ingress serves a self-signed certificate.
+finetune_files_api_tls_verify: "false"
+
+# Remote: finetune_train_no_proxy above MUST name this cluster's host and
+# finetune_files_api_ip. Sending the model upload through the proxy gets a 403,
+# so training succeeds and only the hand-back fails.
+
+# ── Sign-in ──────────────────────────────────────────────────────────────────
+# The platform gateway signs people in against the platform realm of the shared
+# Keycloak, the same login as every other platform UI (Headlamp, Grafana,
+# Langfuse, LiteLLM). This use case adds its browser client and the engine's
+# client to that realm, and a group whose members may use the portal. Users are
+# the platform's: add them to the group in the Keycloak admin console.
+
+# Realm people sign in to. Comes with Toolkit Manager.
+keycloak_realm: "platform"
+
+# Members of this group may use the portal; created when missing.
+finetune_users_group: "finetuning-users"
+# Groups admitted. Blank: platform-admins and finetune_users_group.
+finetune_allowed_groups: []
+
+oidc_client_id: "finetuning-ui"
+# Blank: generated (and set on the client in the shared Keycloak).
+oidc_client_secret: ""
+
+# Public base URL of the shared Keycloak, i.e. the issuer host in the tokens.
+# Blank: read from the Keycloak CR (https://keycloak.<base domain>).
+keycloak_public_url: ""

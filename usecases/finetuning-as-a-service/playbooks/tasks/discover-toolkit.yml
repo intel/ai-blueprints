@@ -1,0 +1,201 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Read what the platform (installed by Toolkit Manager) provides from the
+# cluster itself.
+#
+# This use case installs on top of a running Toolkit Manager platform
+# (with LiteLLM) and never reads its files (inventory, env configs or charts),
+# so it works the same whether the stack was installed from this machine or
+# another one. Anything set in finetune-config.cfg wins over what is
+# discovered here.
+###########################################################################
+
+- name: Check LiteLLM Is Installed
+  command: kubectl get namespace {{ toolkit_gateway_namespace }}
+  changed_when: false
+  register: toolkit_namespace
+  failed_when: false
+
+- name: Fail When LiteLLM Is Missing
+  fail:
+    msg: >-
+      Namespace {{ toolkit_gateway_namespace }} not found. Install Enterprise AI
+      Solutions with LiteLLM first (auth_type: litellm_vkey, or
+      litellm_enabled: true); this use case deploys on top of it.
+  when: toolkit_namespace.rc != 0
+
+# The base domain the platform gateway serves. Every route of this use case
+# lives under finetune_url_prefix on that host, so no extra DNS entry is needed.
+- name: Read the Cluster Domain from the Platform Gateway
+  command: >-
+    kubectl -n {{ platform_gateway_namespace }} get gateway {{ platform_gateway_name }}
+    -o 'jsonpath={.spec.listeners[?(@.name=="{{ platform_gateway_listener }}")].hostname}'
+  changed_when: false
+  failed_when: false
+  register: toolkit_gateway_host
+  when: (finetune_config.cluster_url | default('') | length) == 0
+
+- name: Set the Cluster Domain
+  set_fact:
+    cluster_url: >-
+      {{ finetune_config.cluster_url | default('', true)
+         or toolkit_gateway_host.stdout | default('') | trim }}
+
+- name: Fail When the Cluster Domain Is Unknown
+  fail:
+    msg: >-
+      Could not read the hostname of listener {{ platform_gateway_listener }} on
+      Gateway {{ platform_gateway_namespace }}/{{ platform_gateway_name }}. Set
+      cluster_url in finetune-config.cfg.
+  when: cluster_url | length == 0
+
+# Toolkit Manager routes either by subdomain (the default) or, with
+# routing_mode: path, everything under the apex host by path. Path mode admits
+# an apex route only from a labelled namespace whose paths are registered in
+# the platform's path grants, and moves Keycloak to <host>/keycloak; this use
+# case does neither yet. Path mode shows on the Gateway itself: the apex
+# listener then accepts routes from a namespace selector instead of from All.
+- name: Read the Platform Routing Mode
+  command: >-
+    kubectl -n {{ platform_gateway_namespace }} get gateway {{ platform_gateway_name }}
+    -o 'jsonpath={.spec.listeners[?(@.name=="{{ platform_gateway_listener }}")].allowedRoutes.namespaces.from}'
+  changed_when: false
+  failed_when: false
+  register: toolkit_apex_from
+
+- name: Fail on Path Routing Mode
+  fail:
+    msg: >-
+      The platform gateway runs in path routing mode (routing_mode: path): its
+      {{ platform_gateway_listener }} listener only admits labelled namespaces
+      with registered path grants. FineTuning-as-a-Service supports the
+      default subdomain mode only for now.
+  when: toolkit_apex_from.stdout | default('') | trim == 'Selector'
+
+# Recorded by the platform's gateway role (Toolkit Manager after its
+# self-service routing change) for other repos to read. Older installs have
+# none; only shown in the summary.
+- name: Read the Platform Gateway Record
+  command: >-
+    kubectl -n {{ platform_gateway_namespace }} get configmap gateway-platform
+    -o 'jsonpath={.data.platform}'
+  changed_when: false
+  failed_when: false
+  register: toolkit_gateway_record
+
+# With Istio, the platform lets only listed namespaces call LiteLLM
+# (AuthorizationPolicy litellm-ingress, from litellm_allowed_namespaces). The
+# API registers models and routers through it and Data Prep generates Q&A
+# through it; refused, both fail later and less clearly.
+- name: Read Who May Call LiteLLM
+  command: >-
+    kubectl -n {{ toolkit_gateway_namespace }} get authorizationpolicy litellm-ingress
+    -o 'jsonpath={.spec.rules[*].from[*].source.namespaces}'
+  changed_when: false
+  failed_when: false
+  register: toolkit_litellm_callers
+
+- name: Fail When LiteLLM Refuses This Use Case
+  vars:
+    _allowed: "{{ toolkit_litellm_callers.stdout | default('[]', true) | from_json }}"
+    _missing: "{{ [finetune_api_namespace, dataprep_namespace] | reject('in', _allowed) | list }}"
+  fail:
+    msg: >-
+      LiteLLM admits in-cluster calls only from {{ _allowed | join(', ') }}
+      (Istio policy {{ toolkit_gateway_namespace }}/litellm-ingress). Add
+      {{ _missing | join(' and ') }} to litellm_allowed_namespaces in the
+      platform's env/<name>/config.inference.yaml, keeping the entries above,
+      and re-run ./toolkit_manager.sh install litellm --env <name>.
+  when:
+    - toolkit_litellm_callers.rc == 0
+    - toolkit_litellm_callers.stdout | length > 0
+    - _missing | length > 0
+
+- name: Read the LiteLLM Master Key
+  shell: >-
+    kubectl -n {{ toolkit_gateway_namespace }} get secret {{ litellm_master_key_secret }}
+    -o jsonpath='{.data.master_key}' 2>/dev/null | base64 -d 2>/dev/null || true
+  changed_when: false
+  register: toolkit_master_key
+  no_log: true
+
+# Written by the langfuse role next to LiteLLM, which reports to Langfuse with
+# the same keys. Absent when Langfuse is turned off.
+- name: Read the Langfuse Keys
+  command: >-
+    kubectl -n {{ toolkit_gateway_namespace }} get secret {{ langfuse_keys_secret }}
+    -o jsonpath={.data}
+  changed_when: false
+  failed_when: false
+  register: toolkit_langfuse_keys
+  no_log: true
+
+- name: Pick the Langfuse Keys out of It
+  set_fact:
+    toolkit_langfuse_map: "{{ toolkit_langfuse_keys.stdout | default('{}', true) | from_json }}"
+  no_log: true
+
+- name: Set Gateway Credentials
+  set_fact:
+    litellm_master_key: >-
+      {{ lookup('env', 'LITELLM_MASTER_KEY')
+         or toolkit_master_key.stdout | default('') | trim }}
+    langfuse_public_key: >-
+      {{ finetune_config.langfuse_public_key | default('', true)
+         or toolkit_langfuse_map.LANGFUSE_PUBLIC_KEY | default('') | b64decode }}
+    langfuse_secret_key: >-
+      {{ finetune_config.langfuse_secret_key | default('', true)
+         or toolkit_langfuse_map.LANGFUSE_SECRET_KEY | default('') | b64decode }}
+    langfuse_org_keys: "{{ finetune_config.langfuse_org_keys | default('') }}"
+  no_log: true
+
+- name: Fail When the Gateway Master Key Is Unknown
+  fail:
+    msg: >-
+      Could not read master_key from Secret
+      {{ toolkit_gateway_namespace }}/{{ litellm_master_key_secret }}. Export
+      LITELLM_MASTER_KEY before running deploy.sh. It registers deployed models
+      with the gateway and drives semantic routing.
+  when: litellm_master_key | length == 0
+
+# Optional: only the embedding model download needs it, and only for gated
+# models. The toolkit stores it once for all model releases.
+- name: Read the Hugging Face Token
+  shell: >-
+    kubectl -n {{ finetune_inference_namespace }} get secret {{ toolkit_hf_token_secret }}
+    -o jsonpath='{.data.hugging-face-token}' 2>/dev/null | base64 -d 2>/dev/null || true
+  changed_when: false
+  register: toolkit_hf_token
+  no_log: true
+
+- name: Set the Hugging Face Token
+  set_fact:
+    hugging_face_token: "{{ lookup('env', 'HF_TOKEN') or toolkit_hf_token.stdout | default('') }}"
+  no_log: true
+
+# Image builds and the embedding model's download need the site proxy. Taken
+# from the caller's environment, the same place kubectl and helm get theirs.
+# These values go to pods (BuildKit, vLLM), which must reach in-cluster services
+# (the registry, LiteLLM, the object store) directly, so the cluster's own names
+# are added to no_proxy: a workstation's no_proxy rarely lists them.
+- name: Set Proxy Settings from the Environment
+  set_fact:
+    env_proxy:
+      http_proxy: "{{ lookup('env', 'http_proxy') or lookup('env', 'HTTP_PROXY') }}"
+      https_proxy: "{{ lookup('env', 'https_proxy') or lookup('env', 'HTTPS_PROXY') }}"
+      no_proxy: >-
+        {{ ((lookup('env', 'no_proxy') or lookup('env', 'NO_PROXY')).split(',')
+            + ['localhost', '127.0.0.1', '.svc', '.cluster.local', cluster_url, '.' + cluster_url])
+           | map('trim') | select | unique | join(',') }}
+
+- name: Show What Was Discovered
+  debug:
+    msg:
+      - "Cluster domain    : {{ cluster_url }}"
+      - "Gateway master key: found"
+      - "Langfuse keys     : {{ 'found' if langfuse_public_key | length > 0 else 'not found (trace import disabled)' }}"
+      - "Hugging Face token: {{ 'found' if hugging_face_token | length > 0 else 'not set' }}"
+      - "Proxy             : {{ env_proxy.https_proxy or env_proxy.http_proxy or 'none' }}"
+      - "Gateway           : {{ ((toolkit_gateway_record.stdout | default('', true) or '{}') | from_json).attach_mode | default('no platform record (older install)') }} attach, subdomain routing"

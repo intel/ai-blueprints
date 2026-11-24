@@ -1,0 +1,66 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# This use case's routes on the platform gateway (Envoy Gateway).
+#
+# One HTTPRoute for the UI, API and Data Prep behind the gateway's OIDC
+# sign-in against the platform realm, a job-token route for the training pods,
+# and the public health and docs pages. See helm-charts/gateway-routes.
+###########################################################################
+
+- name: Publish the Routes
+  command: >-
+    helm upgrade --install finetuning-gateway-routes {{ finetune_routes_chart_path }}
+    --namespace {{ finetune_api_namespace }}
+    --set-string host={{ cluster_url | quote }}
+    --set-string basePath={{ finetune_url_prefix | quote }}
+    --set-string platformGateway.name={{ platform_gateway_name | quote }}
+    --set-string platformGateway.namespace={{ platform_gateway_namespace | quote }}
+    --set-string platformGateway.sectionName={{ platform_gateway_listener | quote }}
+    --set-string ui.service={{ finetune_ui_name | quote }}
+    --set-string ui.namespace={{ finetune_ui_namespace | quote }}
+    --set ui.port={{ finetune_ui_service_port | int }}
+    --set-string ui.basePath={{ finetune_ui_base_path | quote }}
+    --set-string api.service={{ finetune_api_name | quote }}
+    --set-string api.namespace={{ finetune_api_namespace | quote }}
+    --set api.port={{ finetune_api_service_port | int }}
+    --set-string dataprep.service={{ dataprep_name | quote }}
+    --set-string dataprep.namespace={{ dataprep_namespace | quote }}
+    --set-string sso.issuer={{ keycloak_issuer | quote }}
+    --set-string sso.issuerInternal={{ keycloak_issuer_internal | quote }}
+    --set-string sso.clientId={{ oidc_client_id | quote }}
+    --set-string sso.clientSecret={{ oidc_client_secret | quote }}
+    --set-json sso.allowedGroups={{ finetune_allowed_groups | to_json | quote }}
+    --wait --timeout 2m
+  no_log: true
+
+# Accepted is not enough: a policy Envoy cannot apply leaves the route open to
+# nobody, and says why only in its status.
+- name: Wait for the Gateway to Accept the Sign-In Policy
+  command: >-
+    kubectl -n {{ finetune_api_namespace }} get securitypolicy finetuning-as-a-service-sso
+    -o 'jsonpath={.status.ancestors[0].conditions[?(@.type=="Accepted")].status}'
+  register: routes_policy
+  until: routes_policy.stdout == 'True'
+  retries: 24
+  delay: 5
+  changed_when: false
+
+# Through the Gateway's own address, so the deploy machine needs no DNS record
+# for the host: an unsigned-in browser must be sent to the platform realm.
+- name: Check Sign-In Is Enforced
+  shell: |
+    set -euo pipefail
+    addr=$(kubectl -n {{ platform_gateway_namespace }} get gateway {{ platform_gateway_name }} \
+             -o jsonpath='{.status.addresses[0].value}')
+    curl -sk -o /dev/null --noproxy '*' --max-time 15 -w '%{http_code} %{redirect_url}' \
+      --resolve "{{ cluster_url }}:443:${addr}" \
+      "https://{{ cluster_url }}{{ finetune_ui_base_path }}"
+  args:
+    executable: /bin/bash
+  register: routes_signin
+  retries: 12
+  delay: 5
+  until: routes_signin.stdout is match('302 .*/realms/' + keycloak_realm + '/protocol/openid-connect/auth')
+  changed_when: false

@@ -1,0 +1,53 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+#
+# Set by playbooks/deploy-routes.yml; the defaults are Toolkit Manager's.
+
+# Host and URL prefix every page and API of this use case is served under.
+host: ""
+basePath: /finetuning-as-a-service
+
+# The platform Gateway and its listener for the base domain.
+platformGateway:
+  name: eg-gateway
+  namespace: envoy-gateway-system
+  sectionName: https-apex
+  # Dataset uploads and model downloads outlast Envoy's default.
+  requestTimeout: 3600s
+
+# Backends. The route lives in the release namespace; the others grant it
+# access with a ReferenceGrant.
+ui:
+  service: finetuning-ui
+  namespace: finetuning-ui
+  port: 3000
+  # The UI's own base path (it is built with it, so it is not rewritten).
+  basePath: /finetuning-as-a-service/ui
+api:
+  service: finetuning-service
+  namespace: finetuning-api
+  port: 8000
+dataprep:
+  service: data-prep-backend
+  namespace: dataprep
+  port: 8000
+
+# Sign-in at the gateway against the platform realm of the shared Keycloak, the
+# way Toolkit Manager signs people in to its own UIs. Envoy runs the
+# OIDC login, keeps the tokens in cookies, refreshes them, admits only the
+# allowed groups and passes the user on in X-Forwarded-User.
+sso:
+  # Issuer as browsers see it (redirects, token `iss`), e.g.
+  # https://keycloak.example.com/realms/platform
+  issuer: ""
+  # The same realm in-cluster (token exchange, signing keys).
+  issuerInternal: ""
+  clientId: finetuning-ui
+  # Kept in a Secret in the release namespace (key client-secret).
+  clientSecret: ""
+  # `groups` claim values admitted; everyone else gets 403.
+  allowedGroups:
+    - platform-admins
+    - finetuning-users
+  # Claim passed to the services as the user name.
+  usernameClaim: preferred_username

@@ -1,0 +1,536 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Deploy the Fine-Tuning Engine
+#
+# The engine is the component that trains. It runs as an ordinary HTTP service
+# with no GPU and turns each request into one Kubernetes Job on GPU nodes:
+#
+#   * local: GPU nodes in this same cluster. The engine uses its
+#     own ServiceAccount, with RBAC created here, and the training pod reads
+#     and writes files through Data Prep's in-cluster Service.
+#   * remote: a separate GPU cluster, reached with the kubeconfig in
+#     finetune_train_kubeconfig; the training pod comes back to the Files API
+#     through this cluster's ingress.
+#
+# finetune_train_mode: auto (the default) picks remote when a kubeconfig is set
+# and local when this cluster has GPU nodes; with neither the run stops here.
+#
+# Deployed after Keycloak (it verifies the caller's bearer token against the
+# realm) and before the API (which is configured to call it).
+###########################################################################
+
+###########################################################################
+# Validation
+###########################################################################
+- name: Fail on an Unknown Training Mode
+  fail:
+    msg: "finetune_train_mode must be auto, local or remote, not '{{ finetune_train_mode }}'."
+  when: finetune_train_mode | default('auto') not in ['auto', 'local', 'remote']
+  run_once: true
+
+# The label the NVIDIA GPU Operator puts on every GPU node.
+- name: Look for GPU Nodes in This Cluster
+  command: kubectl get nodes -l {{ finetune_engine_train_node_selector }} -o name
+  changed_when: false
+  failed_when: false
+  register: finetune_local_gpu_nodes
+  when: (finetune_train_kubeconfig | default('') | length) == 0
+  run_once: true
+
+- name: Choose the Training Mode
+  set_fact:
+    finetune_train_remote: >-
+      {{ finetune_train_mode == 'remote'
+         or (finetune_train_mode == 'auto' and (finetune_train_kubeconfig | default('') | length) > 0) }}
+    finetune_local_gpu_node_count: "{{ (finetune_local_gpu_nodes.stdout_lines | default([])) | length }}"
+  run_once: true
+
+- name: Fail When There Is Nothing to Train On
+  fail:
+    msg: |
+      ERROR: no GPU nodes to train on.
+      This cluster has no node labelled {{ finetune_engine_train_node_selector }} and
+      finetune_train_kubeconfig is empty. Either:
+        * deploy on a cluster with GPU nodes (the NVIDIA GPU Operator
+          labels them), or
+        * set finetune_train_kubeconfig to a separate GPU cluster
+          (docs/deployment.md, "Separate GPU cluster"), or
+        * set finetune_engine_enabled: false to install everything but training.
+  when:
+    - not finetune_train_remote | bool
+    - finetune_train_mode == 'auto'
+    - finetune_local_gpu_node_count | int == 0
+  run_once: true
+
+- name: Warn When Forcing Local Training Without GPU Nodes
+  debug:
+    msg: >-
+      finetune_train_mode is local but no node is labelled
+      {{ finetune_engine_train_node_selector }}: training Jobs will be created
+      and wait Pending until a GPU node joins.
+  when:
+    - not finetune_train_remote | bool
+    - finetune_local_gpu_node_count | int == 0
+  run_once: true
+
+- name: Validate Fine-Tuning Engine Configuration
+  fail:
+    msg: |
+      ERROR: {{ item.name }} is not set!
+      Configure it in {{ finetune_config_file }}.
+  when: item.value | default('') | length == 0
+  loop: >-
+    {{ [{'name': 'nvidia_keycloak_client_id (engine token audience)', 'value': nvidia_keycloak_client_id | default('')},
+        {'name': 'cluster_url', 'value': cluster_url | default('')}]
+       + ([{'name': 'finetune_train_kubeconfig (path to the GPU cluster kubeconfig)', 'value': finetune_train_kubeconfig | default('')},
+           {'name': 'finetune_files_api_ip (this cluster ingress address, reachable from the GPU cluster)', 'value': finetune_files_api_ip | default('')}]
+          if finetune_train_remote | bool else []) }}
+  loop_control:
+    label: "{{ item.name }}"
+  run_once: true
+
+- name: Show the Training Mode
+  debug:
+    msg: >-
+      {{ 'Training on the separate GPU cluster in ' ~ finetune_train_kubeconfig
+         if finetune_train_remote | bool
+         else 'Training on this cluster: ' ~ finetune_local_gpu_node_count ~ ' GPU node(s), namespace ' ~ finetune_engine_train_namespace }}
+  run_once: true
+
+# The kubeconfig is read from the control node's filesystem, not from a variable,
+# precisely so the bearer token in it never passes through Ansible's variable
+# space, the play's log output, or a --extra-vars string.
+- name: Check the GPU Cluster Kubeconfig Exists
+  stat:
+    path: "{{ finetune_train_kubeconfig }}"
+  register: finetune_train_kubeconfig_stat
+  when: finetune_train_remote | bool
+  run_once: true
+
+- name: Fail When the GPU Cluster Kubeconfig Is Missing
+  fail:
+    msg: |
+      ERROR: {{ finetune_train_kubeconfig }} not found.
+      The engine authenticates to the GPU cluster with this kubeconfig. Obtain it
+      from the cluster administrator, keep it mode 0600, and point
+      finetune_train_kubeconfig at it in finetune-config.cfg.
+  when: finetune_train_remote | bool and not finetune_train_kubeconfig_stat.stat.exists
+  run_once: true
+
+###########################################################################
+# Database password: resolved with the other secrets in
+# tasks/resolve-secrets.yml, which reuses the one already in the cluster so a
+# re-run never rotates it out from under a live database.
+###########################################################################
+- name: Use the Resolved Fine-Tuning Engine Database Password
+  set_fact:
+    finetune_engine_db_password: "{{ finetune_engine_postgres_password }}"
+  no_log: true
+
+###########################################################################
+# Infrastructure
+###########################################################################
+- name: Deploy Fine-Tuning Engine PostgreSQL
+  shell: |
+    helm upgrade --install {{ finetune_engine_postgres_release }} {{ finetune_api_source_path }}/helm-charts/postgresql \
+      --namespace {{ finetune_engine_namespace }} \
+      --set auth.username={{ finetune_engine_postgres_username }} \
+      --set auth.password={{ finetune_engine_db_password }} \
+      --set auth.database={{ finetune_engine_postgres_database }} \
+      --set persistence.enabled=true \
+      --set persistence.storageClass={{ finetune_persistence_storage_class }} \
+      --set persistence.size={{ finetune_engine_postgres_storage_size }} \
+      --wait --timeout 5m
+  args:
+    executable: /bin/bash
+  run_once: true
+  no_log: true
+
+# Created from the file rather than with --set: a --set value is copied into the
+# Helm release Secret and into the shell history, where a bearer token for
+# another cluster would outlive this deployment. The engine chart deliberately
+# does not template this Secret for the same reason.
+- name: Create the GPU Cluster Kubeconfig Secret
+  shell: |
+    set -euo pipefail
+    kubectl create secret generic {{ finetune_engine_train_kubeconfig_secret }} \
+      --namespace {{ finetune_engine_namespace }} \
+      --from-file=config={{ finetune_train_kubeconfig }} \
+      --dry-run=client -o yaml | kubectl apply -f -
+  args:
+    executable: /bin/bash
+  when: finetune_train_remote | bool
+  run_once: true
+
+###########################################################################
+# Local training: the namespace the Jobs run in, and the rights
+# the engine's ServiceAccount needs there. The same rights a remote GPU
+# cluster's administrator grants (docs/deployment.md).
+###########################################################################
+- name: Create the Training Namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: Namespace
+      metadata:
+        name: "{{ finetune_engine_train_namespace }}"
+        # In the mesh: the training pod calls Data Prep, which refuses
+        # plaintext from outside it. Pod Security baseline: training needs
+        # nothing privileged.
+        labels: "{{ finetune_namespace_labels | combine({'pod-security.kubernetes.io/enforce': 'baseline'}) }}"
+  when: not finetune_train_remote | bool
+  run_once: true
+
+- name: Grant the Engine Its Rights in the Training Namespace
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      - apiVersion: rbac.authorization.k8s.io/v1
+        kind: Role
+        metadata:
+          name: "{{ finetune_engine_name }}"
+          namespace: "{{ finetune_engine_train_namespace }}"
+        rules:
+          - apiGroups: ["batch"]
+            resources: ["jobs"]
+            verbs: ["create", "get", "list", "watch", "delete"]
+          - apiGroups: [""]
+            resources: ["pods", "pods/log"]
+            verbs: ["get", "list", "watch"]
+          - apiGroups: [""]
+            resources: ["pods/exec"]
+            verbs: ["create"]
+          - apiGroups: [""]
+            resources: ["configmaps", "secrets"]
+            verbs: ["create", "get", "list", "delete"]
+          - apiGroups: [""]
+            resources: ["persistentvolumeclaims"]
+            verbs: ["create", "get"]
+          - apiGroups: [""]
+            resources: ["resourcequotas", "limitranges", "events"]
+            verbs: ["get", "list"]
+      - apiVersion: rbac.authorization.k8s.io/v1
+        kind: RoleBinding
+        metadata:
+          name: "{{ finetune_engine_name }}"
+          namespace: "{{ finetune_engine_train_namespace }}"
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: Role
+          name: "{{ finetune_engine_name }}"
+        subjects:
+          - kind: ServiceAccount
+            name: "{{ finetune_engine_name }}"
+            namespace: "{{ finetune_engine_namespace }}"
+      - apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRole
+        metadata:
+          name: "{{ finetune_engine_name }}-nodes"
+        rules:
+          - apiGroups: [""]
+            resources: ["nodes"]
+            verbs: ["get", "list"]
+      - apiVersion: rbac.authorization.k8s.io/v1
+        kind: ClusterRoleBinding
+        metadata:
+          name: "{{ finetune_engine_name }}-nodes"
+        roleRef:
+          apiGroup: rbac.authorization.k8s.io
+          kind: ClusterRole
+          name: "{{ finetune_engine_name }}-nodes"
+        subjects:
+          - kind: ServiceAccount
+            name: "{{ finetune_engine_name }}"
+            namespace: "{{ finetune_engine_namespace }}"
+  when: not finetune_train_remote | bool
+  run_once: true
+
+###########################################################################
+# GPU cluster prerequisites
+#
+# One RWX claim shared by every training Job in the training namespace. Created
+# here, with the same kubeconfig the engine will use, so a deploy that cannot
+# reach the GPU cluster fails now rather than on the first job submission.
+#
+# Both tasks below add the GPU apiserver's host to no_proxy first. Its address is
+# normally a bare IP, which no domain-suffix entry in the inherited proxy
+# configuration can cover, and a corporate proxy typically answers a CONNECT to it with 403 —
+# which kubectl surfaces as "Forbidden", sending you to look for an RBAC problem
+# that does not exist.
+###########################################################################
+- name: Ensure the Shared Training PVC Exists on the GPU Cluster
+  shell: |
+    set -euo pipefail
+    {% if finetune_train_remote | bool %}
+    export KUBECONFIG={{ finetune_train_kubeconfig }}
+    SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    HOST=${SERVER#*://}; HOST=${HOST%%:*}
+    export no_proxy="${no_proxy:+$no_proxy,}$HOST"
+    export NO_PROXY="$no_proxy"
+    {% endif %}
+    if kubectl get pvc {{ finetune_engine_train_pvc }} -n {{ finetune_engine_train_namespace }} >/dev/null 2>&1; then
+      echo "pvc {{ finetune_engine_train_pvc }} already present"
+      exit 0
+    fi
+    # Stop on a class that does not exist, so the claim does not sit Pending.
+    # A GPU cluster account need not be allowed to read storage classes (they
+    # are cluster-scoped), so a refusal is not an answer: carry on.
+    SC_OUT=$(kubectl get storageclass {{ finetune_engine_train_pvc_storage_class }} 2>&1) || true
+    if printf '%s' "${SC_OUT}" | grep -q NotFound; then
+      echo "ERROR: storage class {{ finetune_engine_train_pvc_storage_class }} not found where training runs. Set finetune_train_pvc_storage_class to a ReadWriteMany class there." >&2
+      exit 1
+    fi
+    # ReadWriteMany because concurrent jobs share the HuggingFace cache on it,
+    # and because a queued pod may land on a different node.
+    #
+    # No apostrophes in the comments above: Ansible splits a free-form shell
+    # argument into tokens before the shell ever sees it, knows nothing about "#"
+    # comments, and rejects the whole task at load time with "unbalanced jinja2
+    # block or quotes" over a lone quote in prose.
+    kubectl apply -f - <<'EOF'
+    apiVersion: v1
+    kind: PersistentVolumeClaim
+    metadata:
+      name: {{ finetune_engine_train_pvc }}
+      namespace: {{ finetune_engine_train_namespace }}
+    spec:
+      accessModes:
+        - ReadWriteMany
+      storageClassName: {{ finetune_engine_train_pvc_storage_class }}
+      resources:
+        requests:
+          storage: {{ finetune_engine_train_pvc_size }}
+    EOF
+    echo "pvc {{ finetune_engine_train_pvc }} created"
+  args:
+    executable: /bin/bash
+  register: finetune_engine_train_pvc_result
+  changed_when: "'created' in finetune_engine_train_pvc_result.stdout"
+  run_once: true
+
+- name: Confirm the Training PVC Is Bound
+  shell: |
+    set -euo pipefail
+    {% if finetune_train_remote | bool %}
+    export KUBECONFIG={{ finetune_train_kubeconfig }}
+    SERVER=$(kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}')
+    HOST=${SERVER#*://}; HOST=${HOST%%:*}
+    export no_proxy="${no_proxy:+$no_proxy,}$HOST"
+    export NO_PROXY="$no_proxy"
+    {% endif %}
+    kubectl get pvc {{ finetune_engine_train_pvc }} -n {{ finetune_engine_train_namespace }} \
+      -o jsonpath='{.status.phase}'
+  args:
+    executable: /bin/bash
+  register: finetune_engine_train_pvc_phase
+  until: finetune_engine_train_pvc_phase.stdout == 'Bound'
+  retries: 30
+  delay: 5
+  changed_when: false
+  run_once: true
+
+###########################################################################
+# Engine application
+###########################################################################
+- name: Check Fine-Tuning Engine Helm release status
+  shell: |
+    helm list -n {{ finetune_engine_namespace }} -a --filter '^{{ finetune_engine_name }}$' -o json
+  register: finetune_engine_release_list
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Parse Fine-Tuning Engine Helm release status
+  set_fact:
+    finetune_engine_release_status: "{{ (finetune_engine_release_list.stdout | default('[]') | from_json)[0].status if ((finetune_engine_release_list.stdout | default('[]') | from_json) | length > 0) else 'absent' }}"
+  run_once: true
+
+- name: Remove failed or partial Fine-Tuning Engine Helm release
+  shell: |
+    timeout 60s helm uninstall {{ finetune_engine_name }} -n {{ finetune_engine_namespace }} --wait || true
+  when: finetune_engine_release_status != 'absent' and finetune_engine_release_status != 'deployed'
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+# Built as a folded scalar so it expands to a single line of arguments. A Jinja
+# {% if %} block inside the helm command below can leave a whitespace-only line,
+# and a "\" continuation onto a blank line ends the command early, silently
+# dropping every remaining flag.
+#
+# noProxy goes through --set-json, not --set-string: helm splits a --set value on
+# commas, so a comma-separated list arrives as a broken key list ("key com has no
+# value") or, worse, silently truncated. --set-json parses the value as JSON, so
+# the commas inside the quoted string survive.
+# Locally the training pod sits behind the same proxy as everything else here,
+# so it takes the deploy's own proxy settings unless finetune_train_* say
+# otherwise. Its Files API traffic stays in the cluster (.svc in no_proxy).
+- name: Build Fine-Tuning Engine Trainer Proxy Arguments
+  vars:
+    _local: "{{ not finetune_train_remote | bool }}"
+    _https: "{{ finetune_train_https_proxy | default('', true) or ((env_proxy | default({})).https_proxy | default('') if _local | bool else '') }}"
+    _http: "{{ finetune_train_http_proxy | default('', true) or ((env_proxy | default({})).http_proxy | default('') if _local | bool else '') }}"
+    _no: "{{ finetune_train_no_proxy | default('', true) or ((env_proxy | default({})).no_proxy | default('') if _local | bool else '') or 'localhost,127.0.0.1,.svc,.cluster.local' }}"
+  set_fact:
+    finetune_train_https_proxy: "{{ _https }}"
+    finetune_engine_proxy_args: >-
+      --set-string trainCluster.httpsProxy={{ _https | quote }}
+      --set-string trainCluster.httpProxy={{ _http | quote }}
+      --set-json 'trainCluster.noProxy={{ _no | to_json }}'
+  run_once: true
+
+# Where the training pod reaches the Files API. Remote: back through this
+# cluster's ingress, the host pinned to finetune_files_api_ip. Local: Data
+# Prep's Service directly; it checks the job token itself, so no gateway route
+# is involved.
+- name: Build Fine-Tuning Engine Files API Arguments
+  set_fact:
+    finetune_engine_files_args: >-
+      {% if finetune_train_remote | bool %}
+      --set-string filesApi.url={{ ('https://' + cluster_url + finetune_url_prefix) | quote }}
+      --set-json 'filesApi.resolve={{ (cluster_url + ':' + finetune_files_api_ip) | to_json }}'
+      --set-string filesApi.tlsVerify={{ finetune_files_api_tls_verify | default('false') | quote }}
+      --set-string trainCluster.kubeconfigSecret.name={{ finetune_engine_train_kubeconfig_secret | quote }}
+      {% else %}
+      --set-string filesApi.url={{ ('http://' + dataprep_name + '.' + dataprep_namespace + '.svc.cluster.local:' + (dataprep_service_port | string)) | quote }}
+      --set-json 'filesApi.resolve=""'
+      --set-string filesApi.tlsVerify=true
+      --set-string trainCluster.kubeconfigSecret.name=""
+      {% endif %}
+      --set-string trainCluster.nodeSelector={{ finetune_engine_train_node_selector | quote }}
+  run_once: true
+
+- name: Warn When the Trainer Has No Proxy and Is Not Offline
+  debug:
+    msg: >-
+      finetune_train_https_proxy is empty. If the GPU nodes have no direct
+      internet route, the base-model download from HuggingFace will hang rather
+      than fail, and the job will sit in the "downloading" phase until the job
+      timeout.
+  when: (finetune_train_https_proxy | default('') | trim | length) == 0
+  run_once: true
+
+- name: Deploy Fine-Tuning Engine Helm Chart
+  shell: |
+    helm upgrade --install {{ finetune_engine_name }} {{ finetune_engine_source_path }}/helm-charts/finetuning-engine \
+      --namespace {{ finetune_engine_namespace }} \
+      --set app.replicaCount={{ finetune_engine_replica_count | int }} \
+      --set app.image.repository={{ finetune_engine_image_repository }} \
+      --set app.image.tag={{ finetune_engine_image_tag }} \
+      --set app.image.pullPolicy={{ finetune_engine_image_pull_policy }} \
+      --set app.service.port={{ finetune_engine_service_port | int }} \
+      --set app.resources.requests.cpu={{ finetune_engine_cpu_request }} \
+      --set app.resources.requests.memory={{ finetune_engine_memory_request }} \
+      --set app.resources.limits.cpu={{ finetune_engine_cpu_limit }} \
+      --set app.resources.limits.memory={{ finetune_engine_memory_limit }} \
+      --set app.config.maxConcurrentJobs={{ finetune_engine_max_concurrent_jobs | int }} \
+      --set app.config.gpuMemoryThresholdGb={{ finetune_engine_gpu_memory_threshold_gb }} \
+      --set-string keycloak.issuer={{ keycloak_issuer | quote }} \
+      --set-string keycloak.audience={{ nvidia_keycloak_client_id | quote }} \
+      --set-string keycloak.internalUrl={{ keycloak_issuer_internal | quote }} \
+      --set keycloak.tlsVerify=false \
+      {{ finetune_engine_files_args }} \
+      --set-string trainCluster.kubeconfigMountPath={{ finetune_engine_train_kubeconfig_mount | quote }} \
+      --set-string trainCluster.namespace={{ finetune_engine_train_namespace | quote }} \
+      --set-string trainCluster.image={{ finetune_engine_train_image | quote }} \
+      --set-string trainCluster.pvc={{ finetune_engine_train_pvc | quote }} \
+      --set trainCluster.gpuCount={{ finetune_engine_train_gpu_count | int }} \
+      --set-string trainCluster.cpuRequest={{ finetune_engine_train_cpu_request | quote }} \
+      --set-string trainCluster.cpuLimit={{ finetune_engine_train_cpu_limit | quote }} \
+      --set-string trainCluster.memoryRequest={{ finetune_engine_train_memory_request | quote }} \
+      --set-string trainCluster.memoryLimit={{ finetune_engine_train_memory_limit | quote }} \
+      --set-string waitForDatabase.host={{ (finetune_engine_postgres_release + '.' + finetune_engine_namespace + '.svc.cluster.local') | quote }} \
+      --set logStore.enabled={{ finetune_engine_log_store_enabled | default(true) | bool | lower }} \
+      --set-string logStore.persistence.size={{ finetune_engine_log_store_size | default('20Gi') | quote }} \
+      --set-string logStore.persistence.storageClass={{ finetune_persistence_storage_class | quote }} \
+      --set logStore.retentionDays={{ finetune_engine_log_store_retention_days | default(30) | int }} \
+      --set logStore.archive.enabled={{ finetune_engine_log_archive_enabled | default(true) | bool | lower }} \
+      --set-string logStore.archive.url={{ ('http://' + dataprep_name + '.' + dataprep_namespace + '.svc.cluster.local:' + dataprep_service_port) | quote }} \
+      --set-json 'networkPolicy.ingress.fromNamespaces=["{{ finetune_api_namespace }}"]' \
+      --set-string networkPolicy.egress.keycloakNamespace={{ keycloak_namespace | quote }} \
+      --set-string networkPolicy.egress.filesApiNamespace={{ dataprep_namespace | quote }} \
+      --set networkPolicy.egress.filesApiPort={{ dataprep_service_port | int }} \
+      --set networkPolicy.ambientMesh={{ (finetune_namespace_labels['istio.io/dataplane-mode'] | default('')) == 'ambient' }} \
+      --set-json 'secrets.databaseUrl={{ ('postgresql+asyncpg://' + finetune_engine_postgres_username + ':' + finetune_engine_db_password + '@' + finetune_engine_postgres_release + '.' + finetune_engine_namespace + '.svc.cluster.local:' + finetune_engine_postgres_port + '/' + finetune_engine_postgres_database) | to_json }}' \
+      {{ finetune_engine_proxy_args | default('') }} \
+      --wait --timeout 5m
+  args:
+    executable: /bin/bash
+  run_once: true
+  no_log: true
+
+# Set by build-images.yml, and only when the image was actually rebuilt in this
+# run. See the comment there: the `latest` tag makes a rebuild invisible to
+# `helm upgrade`, so without this the fix that was just built never reaches a pod.
+# imagePullPolicy is Always, so the replacement pod pulls the new layers.
+- name: Restart the Fine-Tuning Engine to Pick Up the Rebuilt Image
+  shell: |
+    kubectl rollout restart deployment/{{ finetune_engine_name }} \
+      --namespace={{ finetune_engine_namespace }}
+  when: finetune_images_rebuilt | default(false) | bool
+  run_once: true
+
+- name: Wait for the Fine-Tuning Engine to be Ready
+  shell: |
+    kubectl rollout status deployment/{{ finetune_engine_name }} \
+      --namespace={{ finetune_engine_namespace }} \
+      --timeout=300s
+  run_once: true
+
+# Reads the engine's own view of the GPU cluster. /info is used rather than
+# /finetune/gpu-status because the latter requires a bearer token; it carries the
+# full probe result, so a failure names the cause instead of just denying a GPU.
+#
+# Queried by exec-ing into the engine pod, NOT from a throwaway pod curling the
+# Service: the engine's own NetworkPolicy admits only the Fine-Tuning API
+# namespace, so a probe pod anywhere else times out and the check reports "no GPU"
+# for a perfectly healthy engine. urllib is used because the image is a slim
+# Python one with no curl or wget.
+#
+# A pod that is Ready but reports no GPU means the kubeconfig, the training
+# namespace or the node selector is wrong, and every job would be rejected with
+# "No GPU available" — a failure that otherwise only surfaces on the first
+# submission, where it reads as a UI problem.
+- name: Verify the Engine Can See the GPU Cluster
+  shell: |
+    set -euo pipefail
+    POD=$(kubectl get pod -n {{ finetune_engine_namespace }} \
+            -l app.kubernetes.io/name={{ finetune_engine_name }} \
+            --field-selector=status.phase=Running \
+            -o jsonpath='{.items[0].metadata.name}')
+    kubectl exec -n {{ finetune_engine_namespace }} "$POD" -c {{ finetune_engine_name }} -- \
+      python -c 'import json,urllib.request; print(json.dumps(json.load(urllib.request.urlopen("http://127.0.0.1:{{ finetune_engine_service_port }}/info", timeout=20)).get("gpu_info", {})))'
+  args:
+    executable: /bin/bash
+  register: finetune_engine_ready
+  changed_when: false
+  failed_when: false
+  run_once: true
+
+- name: Report the Engine's GPU View
+  debug:
+    msg:
+      - "=============================================================="
+      - "Fine-Tuning Engine deployed."
+      - "  Service    : http://{{ finetune_engine_name }}.{{ finetune_engine_namespace }}.svc.cluster.local:{{ finetune_engine_service_port }}"
+      - "  Training   : namespace {{ finetune_engine_train_namespace }} on the GPU cluster"
+      - "  GPU probe  : {{ finetune_engine_ready.stdout | default('unavailable') | trim }}"
+      - "=============================================================="
+  run_once: true
+
+- name: Warn When the Engine Reports No GPU
+  debug:
+    msg: >-
+      The engine is running but reports no usable GPU. Check the kubeconfig
+      Secret {{ finetune_engine_train_kubeconfig_secret }}, that namespace
+      {{ finetune_engine_train_namespace }} has a GPU quota, and that the node
+      selector in the chart matches a label on the GPU nodes. Jobs submitted now
+      will be rejected as "No GPU available".
+  when: >-
+    finetune_engine_ready.rc != 0 or
+    ('"available": true' not in (finetune_engine_ready.stdout | default('')) and
+     '"available":true' not in (finetune_engine_ready.stdout | default('')))
+  run_once: true

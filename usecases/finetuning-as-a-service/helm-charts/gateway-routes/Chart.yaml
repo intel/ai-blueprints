@@ -1,0 +1,11 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+apiVersion: v2
+name: finetuning-gateway-routes
+description: >-
+  FineTuning-as-a-Service on the platform's Envoy Gateway: one signed-in route
+  for the UI, API and Data Prep, the training pods' job-token route, and the
+  public health and docs pages.
+type: application
+version: 1.0.0
+appVersion: "1.0.0"

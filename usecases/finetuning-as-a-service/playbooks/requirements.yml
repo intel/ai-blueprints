@@ -1,0 +1,7 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+# Ansible collections for the deploy playbooks (installed by ../deploy.sh).
+collections:
+  - name: kubernetes.core
+    version: ">=2.4.0,<6.0.0"

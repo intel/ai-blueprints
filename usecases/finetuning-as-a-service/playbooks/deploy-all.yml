@@ -1,0 +1,473 @@
+# Copyright (C) 2024-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# FineTuning-as-a-Service - Main Orchestration Playbook
+#
+# Deploys every component on top of a platform installed by Toolkit Manager.
+# Run it through ../deploy.sh, which sets up Ansible and passes the options;
+# it runs on the machine with kubectl access (connection: local) and needs no
+# inventory or files from the toolkit.
+#
+# Every component also carries a tag, so one can be redeployed without touching
+# the others:
+#
+#   --tags engine        Fine-Tuning Engine only (its PostgreSQL, the GPU-cluster
+#                        kubeconfig Secret, the shared training PVC, the chart)
+#   --tags api           Fine-Tuning API only
+#   --tags ui            Fine-Tuning UI only
+#   --tags dataprep      Data Prep only
+#   --tags keycloak      This use case's clients in the shared Keycloak
+#   --tags routes        Its routes on the platform gateway (sign-in included)
+#   --tags embedding     Semantic-routing embedding model only
+#   --tags build         Rebuild the container images only
+#   --tags build,engine  Rebuild, then redeploy the engine
+#
+# Everything the components share -- the configuration read out of
+# finetune-config.cfg, what is discovered from the toolkit, the resolved
+# secrets, the namespaces, the registry trust -- is tagged `always` and so runs
+# whichever tag is selected. Note that `build` rebuilds ALL images, not just the
+# selected component's: build-images.yml is not itself tag-partitioned, and the
+# per-image BuildKit cache makes rebuilding the untouched ones cheap.
+###########################################################################
+
+- name: Deploy FineTuning-as-a-Service
+  hosts: localhost
+  connection: local
+  gather_facts: false
+  any_errors_fatal: true
+
+  vars_files:
+    - ../vars/finetune-plugin-vars.yml
+
+  pre_tasks:
+    - name: Check the Configuration File Exists
+      stat:
+        path: "{{ finetune_config_file }}"
+      register: finetune_config_stat
+      tags: always
+
+    - name: Fail When the Configuration File Is Missing
+      fail:
+        msg: |
+          {{ finetune_config_file }} not found.
+          Copy finetune-config.cfg.example to finetune-config.cfg and fill it in.
+      when: not finetune_config_stat.stat.exists
+      tags: always
+
+    - name: Read the FineTuning-as-a-Service Configuration
+      include_vars:
+        file: "{{ finetune_config_file }}"
+        name: finetune_config
+      tags: always
+
+    - name: Discover the Platform
+      include_tasks:
+        file: tasks/discover-toolkit.yml
+        apply:
+          tags: always
+      tags: always
+
+    - name: Validate Required Configuration
+      fail:
+        msg: |
+          ERROR: {{ item.name }} is not set!
+          Please configure it in {{ finetune_config_file }}
+      when: finetune_config[item.key] is not defined or finetune_config[item.key] | default('') | length == 0
+      loop:
+        - { key: 'nvidia_finetune_backend_url', name: 'Fine-Tuning Engine URL' }
+        - { key: 'nvidia_keycloak_client_id', name: 'Fine-Tuning Engine client id' }
+      tags: always
+
+    - name: Set Configuration Variables
+      set_fact:
+        finetune_registry: "{{ finetune_config.finetune_registry | default(finetune_registry_default, true) }}"
+        # How the Fine-Tuning API reaches the engine. "nvidia_" is historical.
+        nvidia_finetune_backend_url: "{{ finetune_config.nvidia_finetune_backend_url }}"
+        nvidia_keycloak_token_url: "{{ finetune_config.nvidia_keycloak_token_url | default('') }}"
+        nvidia_keycloak_client_id: "{{ finetune_config.nvidia_keycloak_client_id }}"
+        nvidia_keycloak_verify_ssl: "{{ finetune_config.nvidia_keycloak_verify_ssl | default('true', true) }}"
+        # Data Prep's Q&A generation: a chat model on the platform's LiteLLM.
+        # Blank: the first one it serves that is not a fine-tuned model.
+        dataprep_llm_model_name: "{{ finetune_config.finetune_qa_model | default('', true) }}"
+        # ── Fine-Tuning Engine (training control plane) ──────────────────────
+        # It has no GPU of its own: each request becomes one Kubernetes Job on
+        # the GPU cluster named by finetune_train_kubeconfig.
+        finetune_engine_enabled: "{{ finetune_config.finetune_engine_enabled | default(false) | bool }}"
+        finetune_train_kubeconfig: "{{ finetune_config.finetune_train_kubeconfig | default('') }}"
+        # auto: a separate GPU cluster when finetune_train_kubeconfig is set,
+        # else this cluster when it has GPU nodes. local / remote
+        # force one. Resolved in deploy-finetuning-engine.yml.
+        finetune_train_mode: "{{ finetune_config.finetune_train_mode | default('auto', true) }}"
+        finetune_engine_train_namespace: "{{ finetune_config.finetune_train_namespace | default('ftaas', true) }}"
+        finetune_engine_train_pvc_storage_class: "{{ finetune_config.finetune_train_pvc_storage_class | default(finetune_engine_train_pvc_storage_class, true) }}"
+        finetune_files_api_ip: "{{ finetune_config.finetune_files_api_ip | default('') }}"
+        finetune_files_api_tls_verify: "{{ finetune_config.finetune_files_api_tls_verify | default('false', true) }}"
+        finetune_train_https_proxy: "{{ finetune_config.finetune_train_https_proxy | default('') }}"
+        finetune_train_http_proxy: "{{ finetune_config.finetune_train_http_proxy | default('') }}"
+        finetune_train_no_proxy: "{{ finetune_config.finetune_train_no_proxy | default('localhost,127.0.0.1,.svc,.cluster.local', true) }}"
+        # Auto-populate service URLs
+        dataprep_service_url: "https://{{ cluster_url }}/dataprep"
+        finetune_api_service_url: "https://{{ cluster_url }}/training"
+        finetune_ui_service_url: "https://{{ cluster_url }}/finetune/ui"
+        # ── Sign-in: the platform realm of the shared Keycloak ───────────────
+        keycloak_realm: "{{ finetune_config.keycloak_realm | default('platform', true) }}"
+        oidc_client_id: "{{ finetune_config.oidc_client_id | default('finetuning-ui', true) }}"
+        # Who may use the portal: the `groups` claim values the gateway admits.
+        finetune_users_group: "{{ finetune_config.finetune_users_group | default('finetuning-users', true) }}"
+        finetune_allowed_groups: >-
+          {{ finetune_config.finetune_allowed_groups | default([], true)
+             or ['platform-admins', finetune_config.finetune_users_group | default('finetuning-users', true)] }}
+      tags: always
+
+    # The shared Keycloak runs on a host of its own (keycloak.<base domain>), set
+    # on its Keycloak CR by Toolkit Manager. That host is the issuer the
+    # tokens carry, so it is read from the cluster rather than derived from
+    # cluster_url.
+    - name: Read the Keycloak Public URL
+      command: >-
+        kubectl -n {{ keycloak_namespace }} get keycloak {{ keycloak_cr_name }}
+        -o jsonpath={.spec.hostname.hostname}
+      changed_when: false
+      failed_when: false
+      register: keycloak_cr_hostname
+      when: (finetune_config.keycloak_public_url | default('') | length) == 0
+      tags: always
+
+    - name: Set the Keycloak Public URL
+      set_fact:
+        keycloak_public_url: >-
+          {{ (finetune_config.keycloak_public_url | default('', true)
+              or keycloak_cr_hostname.stdout | default('') | trim) | regex_replace('/$', '') }}
+      tags: always
+
+    - name: Fail When the Keycloak Public URL Is Unknown
+      fail:
+        msg: >-
+          Could not read spec.hostname.hostname from Keycloak
+          {{ keycloak_namespace }}/{{ keycloak_cr_name }}. Set keycloak_public_url
+          (e.g. https://keycloak.example.com) in {{ finetune_config_file }}.
+      when: keycloak_public_url is not match('^https?://')
+      tags: always
+
+    # The realm as browsers see it (redirects, the issuer in every token) and
+    # in-cluster, where pods exchange codes and fetch keys.
+    - name: Set the Issuer URLs
+      set_fact:
+        keycloak_issuer: "{{ keycloak_public_url }}{{ keycloak_relative_path }}/realms/{{ keycloak_realm }}"
+        keycloak_issuer_internal: >-
+          {{ 'http://' + keycloak_service + '.' + keycloak_namespace + '.svc.cluster.local:8080'
+             + keycloak_relative_path + '/realms/' + keycloak_realm }}
+      tags: always
+
+    - name: Set the Engine Token URL
+      set_fact:
+        nvidia_keycloak_token_url: >-
+          {{ nvidia_keycloak_token_url or keycloak_issuer_internal + '/protocol/openid-connect/token' }}
+      tags: always
+
+    - name: Resolve Secrets
+      include_tasks:
+        file: tasks/resolve-secrets.yml
+        apply:
+          tags: always
+      tags: always
+
+    - name: Set Values Derived from Secrets
+      set_fact:
+        dataprep_llm_api_key: "{{ litellm_master_key }}"
+      no_log: true
+      tags: always
+
+  tasks:
+    ###########################################################################
+    # Deployment Overview
+    ###########################################################################
+    - name: Display Deployment Configuration
+      debug:
+        msg:
+          - "=============================================="
+          - "Deploying FineTuning-as-a-Service"
+          - "=============================================="
+          - "Namespaces:"
+          - "  - {{ dataprep_namespace }} (Data Prep Service)"
+          - "  - {{ finetune_api_namespace }} (Fine-Tuning API)"
+          - "  - {{ finetune_engine_namespace }} (Fine-Tuning Engine){{ '' if finetune_engine_enabled | bool else ' [disabled]' }}"
+          - "  - {{ finetune_ui_namespace }} (Fine-Tuning UI)"
+          - "Domain: {{ cluster_url }}"
+          - "Deployment Sequence:"
+          - "  1. Build container images"
+          - "  2. Deploy Data Prep (MinIO, PostgreSQL, Redis, Backend, Celery)"
+          - "  3. Deploy Fine-Tuning Engine (PostgreSQL, engine service){{ '' if finetune_engine_enabled | bool else ' [skipped]' }}"
+          - "  4. Deploy Fine-Tuning API (PostgreSQL, API service)"
+          - "  5. Deploy Fine-Tuning UI (Frontend)"
+          - "Sign-in: {{ keycloak_issuer }} (groups {{ finetune_allowed_groups | join(', ') }})"
+          - "=============================================="
+      tags: always
+
+    ###########################################################################
+    # Create Namespaces
+    ###########################################################################
+    - name: Ensure DataPrep Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ dataprep_namespace }}"
+            labels: "{{ finetune_namespace_labels }}"
+      tags: always
+
+    - name: Ensure Fine-Tuning API Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_api_namespace }}"
+            labels: "{{ finetune_namespace_labels }}"
+      tags: always
+
+    # Labelled explicitly: the engine's NetworkPolicy admits the API by
+    # namespaceSelector on kubernetes.io/metadata.name, which the API server sets
+    # automatically on 1.21+, but the label on THIS namespace is also what any
+    # future policy would select on.
+    - name: Ensure Fine-Tuning Engine Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_engine_namespace }}"
+            labels: "{{ finetune_namespace_labels }}"
+      when: finetune_engine_enabled | default(false) | bool
+      tags: always
+
+    - name: Ensure Inference Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_inference_namespace }}"
+            labels: "{{ finetune_namespace_labels }}"
+      tags: always
+
+    - name: Ensure Fine-Tuning UI Namespace Exists
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Namespace
+          metadata:
+            name: "{{ finetune_ui_namespace }}"
+            labels: "{{ finetune_namespace_labels }}"
+      tags: always
+
+    ###########################################################################
+    # Build Images
+    ###########################################################################
+    # Configure local registry and build images
+    ###########################################################################
+    # The in-cluster registry serves plain HTTP, so containerd on this node has
+    # to be told to trust it. Skipped once the file exists, so a re-run does not
+    # ask for sudo.
+    - name: Check containerd Already Trusts the Registry
+      stat:
+        path: "/etc/containerd/certs.d/{{ finetune_registry }}/hosts.toml"
+      register: finetune_registry_trust
+      tags: always
+
+    - name: Ensure containerd certs.d directory exists for the registry
+      ansible.builtin.file:
+        path: "/etc/containerd/certs.d/{{ finetune_registry }}"
+        state: directory
+        mode: '0755'
+      become: true
+      when:
+        - finetune_registry == finetune_registry_default
+        - not finetune_registry_trust.stat.exists
+      tags: always
+
+    - name: Configure containerd insecure registry for local image pull
+      ansible.builtin.copy:
+        dest: "/etc/containerd/certs.d/{{ finetune_registry }}/hosts.toml"
+        content: |
+          server = "http://{{ finetune_registry }}"
+          [host."http://{{ finetune_registry }}"]
+            capabilities = ["pull", "resolve", "push"]
+            skip_verify = true
+        owner: root
+        group: root
+        mode: '0644'
+      become: true
+      when:
+        - finetune_registry == finetune_registry_default
+        - not finetune_registry_trust.stat.exists
+      tags: always
+
+    # apply: is what makes the tag reach the tasks inside the file. A dynamic
+    # include passes its tags to the include STATEMENT only, so without this the
+    # include runs and then every task it pulled in is filtered out -- a silent
+    # no-op that looks like a successful run.
+    - name: Build Container Images
+      include_tasks:
+        file: build-images.yml
+        apply:
+          tags: build
+      tags: build
+
+    ###########################################################################
+    # Deploy Components using separate playbooks
+    ###########################################################################
+    # Read by the Fine-Tuning API, which registers served models with the
+    # gateway and manages semantic routers.
+    - name: Publish the Gateway Master Key
+      kubernetes.core.k8s:
+        state: present
+        definition:
+          apiVersion: v1
+          kind: Secret
+          metadata:
+            name: "{{ finetune_gateway_master_key_secret }}"
+            namespace: "{{ finetune_api_namespace }}"
+          type: Opaque
+          stringData:
+            LITELLM_MASTER_KEY: "{{ litellm_master_key }}"
+      no_log: true
+      tags: [embedding, api]
+
+    # Earlier versions also put it where the models run, for their
+    # registration Jobs; nothing there needs it now.
+    - name: Remove the Gateway Master Key from the Inference Namespace
+      kubernetes.core.k8s:
+        state: absent
+        api_version: v1
+        kind: Secret
+        name: "{{ finetune_gateway_master_key_secret }}"
+        namespace: "{{ finetune_inference_namespace }}"
+      tags: [embedding, api]
+
+    # Before the embedding model and the API, which both serve with it.
+    - name: Prepare Model Serving
+      include_tasks:
+        file: deploy-serving.yml
+        apply:
+          tags: [embedding, api]
+      tags: [embedding, api]
+
+    # Before the routes, which sign people in with its client.
+    - name: Configure the Clients in the Shared Keycloak
+      include_tasks:
+        file: deploy-keycloak.yml
+        apply:
+          tags: keycloak
+      tags: keycloak
+
+    - name: Deploy Data Preparation Service
+      include_tasks:
+        file: deploy-dataprep.yml
+        apply:
+          tags: dataprep
+      tags: dataprep
+
+    # Before the API, so the router's encoder exists by the time anyone can
+    # reach the semantic-routing endpoints.
+    - name: Deploy Embedding Model for Semantic Routing
+      include_tasks:
+        file: deploy-embedding-model.yml
+        apply:
+          tags: embedding
+      when: finetune_embedding_enabled | default(true) | bool
+      tags: embedding
+
+    # Before the API, which is configured to call it, and after Keycloak, whose
+    # realm issues the token it accepts.
+    - name: Deploy Fine-Tuning Engine
+      include_tasks:
+        file: deploy-finetuning-engine.yml
+        apply:
+          tags: engine
+      when: finetune_engine_enabled | default(false) | bool
+      tags: engine
+
+    - name: Deploy Fine-Tuning API
+      include_tasks:
+        file: deploy-finetuning-api.yml
+        apply:
+          tags: api
+      tags: api
+
+    - name: Deploy Fine-Tuning UI
+      include_tasks:
+        file: deploy-ui.yml
+        apply:
+          tags: ui
+      tags: ui
+
+    - name: Publish the Routes on the Platform Gateway
+      include_tasks:
+        file: deploy-routes.yml
+        apply:
+          tags: routes
+      tags: routes
+
+    # Earlier versions put APISIX in front of the use case. Removed last: the
+    # charts above have dropped their ApisixRoutes by now, while its controller
+    # was still there to release them.
+    - name: Remove APISIX Left by an Earlier Version
+      shell: |
+        set -euo pipefail
+        if helm status auth-apisix -n auth-apisix >/dev/null 2>&1; then
+          helm uninstall auth-apisix -n auth-apisix --wait
+          echo removed
+        fi
+        kubectl delete namespace auth-apisix --ignore-not-found --wait=false
+      args:
+        executable: /bin/bash
+      register: apisix_cleanup
+      changed_when: "'removed' in apisix_cleanup.stdout"
+      tags: routes
+
+    ###########################################################################
+    # Verification
+    ###########################################################################
+    - name: Wait for All Components to be Ready
+      debug:
+        msg:
+          - "=============================================="
+          - "FineTuning-as-a-Service Deployment Complete!"
+          - "=============================================="
+          - "Access URLs:"
+          - "  UI:      https://{{ cluster_url }}{{ finetune_ui_base_path }}"
+          - "  API:     https://{{ cluster_url }}{{ finetune_url_prefix }}/api/docs"
+          - "  DataPrep: https://{{ cluster_url }}{{ finetune_url_prefix }}/dataprep/docs"
+          - ""
+          - "Sign-in: realm {{ keycloak_realm }}; groups {{ finetune_allowed_groups | join(', ') }}"
+          - "=============================================="
+      tags: always
+
+    - name: Verify Pod Status
+      shell: |
+        echo "DataPrep Namespace:"
+        kubectl get pods -n {{ dataprep_namespace }}
+        echo ""
+        echo "Fine-Tuning API Namespace:"
+        kubectl get pods -n {{ finetune_api_namespace }}
+        echo ""
+        echo "Fine-Tuning Engine Namespace:"
+        kubectl get pods -n {{ finetune_engine_namespace }} 2>/dev/null || echo "(not deployed)"
+        echo ""
+        echo "Fine-Tuning UI Namespace:"
+        kubectl get pods -n {{ finetune_ui_namespace }}
+      register: pod_status
+      tags: always
+
+    - name: Display Pod Status
+      debug:
+        msg: "{{ pod_status.stdout_lines }}"
+      tags: always

@@ -1,0 +1,54 @@
+replicaCount: 1
+image:
+  repository: localhost:5000/data-prep-backend
+  tag: latest
+  pullPolicy: Always
+service:
+  type: ClusterIP
+  port: 8000
+  targetPort: 8000
+env:
+- name: HOST
+  value: 0.0.0.0
+- name: PORT
+  value: '8000'
+- name: API_BASE_PATH
+  value: /finetuning-as-a-service/dataprep
+- name: ROOT_PATH
+  value: /finetuning-as-a-service/dataprep
+- name: MINIO_ENDPOINT
+  value: minio.dataprep.svc.cluster.local:9000
+- name: MINIO_BUCKET_NAME
+  value: dataprep
+- name: MINIO_SECURE
+  value: 'false'
+- name: MINIO_REGION
+  value: us-west-2
+- name: MINIO_CERT_VERIFY
+  value: 'false'
+- name: DB_HOST
+  value: postgres.dataprep.svc.cluster.local
+- name: DB_PORT
+  value: '5432'
+- name: DB_NAME
+  value: dataprep
+- name: DB_USER
+  value: postgres
+- name: DB_POOL_SIZE
+  value: '5'
+- name: DB_MAX_OVERFLOW
+  value: '10'
+- name: DB_POOL_RECYCLE
+  value: '3600'
+- name: ALLOWED_ORIGINS
+  value: http://localhost:3000,http://localhost:8080
+secretEnv:
+- name: MINIO_ACCESS_KEY
+  secretName: minio-credentials
+  secretKey: access-key
+- name: MINIO_SECRET_KEY
+  secretName: minio-credentials
+  secretKey: secret-key
+- name: DB_PASSWORD
+  secretName: postgres-credentials
+  secretKey: password

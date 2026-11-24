@@ -1,0 +1,123 @@
+# Copyright (C) 2024-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Build Container Images using BuildKit (rootless)
+###########################################################################
+- name: Display Build Message
+  debug:
+    msg:
+      - "=============================================="
+      - "Building container images with BuildKit (rootless)..."
+      - "This will take several minutes."
+      - "Build Order: DataPrep → Engine → API → UI"
+      - "=============================================="
+  run_once: true
+
+- name: Ensure BuildKit scripts are executable
+  shell: |
+    chmod +x {{ dataprep_source_path }}/buildkit/data-prep/deploy-dataprep.sh
+    chmod +x {{ dataprep_source_path }}/buildkit/celery/deploy-celery.sh
+    chmod +x {{ finetune_api_source_path }}/buildkit/deploy-finetuning.sh
+    chmod +x {{ finetune_engine_source_path }}/buildkit/deploy-engine.sh
+    chmod +x {{ finetune_ui_source_path }}/deployment/buildkit/deploy-frontend.sh
+  run_once: true
+
+- name: Set proxy build args for BuildKit
+  set_fact:
+    buildkit_proxy_args: >-
+      {% if env_proxy is defined and env_proxy.http_proxy | default('') != '' %}
+      HTTP_PROXY={{ env_proxy.http_proxy }}
+      http_proxy={{ env_proxy.http_proxy }}
+      {% if env_proxy.https_proxy | default('') != '' %}
+      HTTPS_PROXY={{ env_proxy.https_proxy }}
+      https_proxy={{ env_proxy.https_proxy }}
+      {% endif %}
+      {% if env_proxy.no_proxy | default('') != '' %}
+      NO_PROXY={{ env_proxy.no_proxy }}
+      no_proxy={{ env_proxy.no_proxy }}
+      {% endif %}
+      {% else %}
+      {% endif %}
+  run_once: true
+
+- name: Build Data Prep Backend Image with BuildKit
+  shell: |
+    kubectl delete job buildkit-data-prep-backend -n {{ dataprep_namespace }} --ignore-not-found=true 2>/dev/null || true
+    cd {{ dataprep_source_path }}/buildkit/data-prep && \
+    NAMESPACE={{ dataprep_namespace }} REGISTRY_URL={{ finetune_registry | quote }} {{ buildkit_proxy_args | trim }} ./deploy-dataprep.sh
+  run_once: true
+
+###########################################################################
+# Build Data Prep Celery Worker Image with BuildKit
+###########################################################################
+- name: Build Celery Worker Image with BuildKit
+  shell: |
+    kubectl delete job buildkit-celery-worker -n {{ dataprep_namespace }} --ignore-not-found=true 2>/dev/null || true
+    cd {{ dataprep_source_path }}/buildkit/celery && \
+    NAMESPACE={{ dataprep_namespace }} REGISTRY_URL={{ finetune_registry | quote }} {{ buildkit_proxy_args | trim }} ./deploy-celery.sh
+    kubectl wait --for=condition=complete --timeout=600s job/buildkit-celery-worker -n {{ dataprep_namespace }}
+  run_once: true
+
+###########################################################################
+# Build Fine-Tuning Engine Image with BuildKit
+#
+# CPU-only: the engine does not train, it creates Kubernetes Jobs that do. The ML
+# stack lives in the digest-pinned trainer image on the GPU cluster, so this build
+# is as small and as quick as the API's.
+###########################################################################
+- name: Build Fine-Tuning Engine Image with BuildKit
+  shell: |
+    cd {{ finetune_engine_source_path }}/buildkit && \
+    NAMESPACE={{ finetune_engine_namespace }} REGISTRY_URL={{ finetune_registry | quote }} {{ buildkit_proxy_args | trim }} ./deploy-engine.sh
+  when: finetune_engine_enabled | default(false) | bool
+  run_once: true
+
+###########################################################################
+# Build Fine-Tuning API Image with BuildKit (uses MinIO from DataPrep)
+###########################################################################
+- name: Build Fine-Tuning API Image with BuildKit
+  shell: |
+    cd {{ finetune_api_source_path }}/buildkit && \
+    NAMESPACE={{ finetune_api_namespace }} REGISTRY_URL={{ finetune_registry | quote }} {{ buildkit_proxy_args | trim }} ./deploy-finetuning.sh
+  run_once: true
+
+###########################################################################
+# Build Fine-Tuning UI Image with BuildKit (THIRD)
+###########################################################################
+- name: Build Fine-Tuning UI Image with BuildKit
+  shell: |
+    cd {{ finetune_ui_source_path }}/deployment/buildkit && \
+    NAMESPACE={{ finetune_ui_namespace }} \
+    REGISTRY_URL={{ finetune_registry | quote }} {{ buildkit_proxy_args | trim }} \
+    NEXT_PUBLIC_BASE_PATH={{ finetune_ui_base_path | quote }} \
+    NEXT_PUBLIC_FILES_BASE_URL={{ ('https://' + cluster_url + finetune_url_prefix) | quote }} \
+    NEXT_PUBLIC_DATAPREP_BASE_URL={{ ('https://' + cluster_url + finetune_url_prefix) | quote }} \
+    NEXT_PUBLIC_FINETUNING_API_URL={{ ('https://' + cluster_url + finetune_url_prefix) | quote }} \
+    NEXT_TELEMETRY_DISABLED=1 \
+    ./deploy-frontend.sh
+  run_once: true
+
+- name: Display Build Complete Message
+  debug:
+    msg:
+      - "=============================================="
+      - "Container images built successfully!"
+      - "=============================================="
+  run_once: true
+
+###########################################################################
+# Every image above is pushed under the tag `latest`. That tag does not change
+# when the image behind it does, so the Deployment spec each component chart
+# renders is byte-identical before and after a rebuild and `helm upgrade` finds
+# nothing to roll -- the freshly built image sits in the registry while the old
+# pods keep serving the old code, and the run reports success either way. The
+# component deploys read this fact and restart their Deployments explicitly.
+#
+# A fact rather than an unconditional restart, so that a config-only run
+# (`--tags engine`) leaves healthy pods alone.
+###########################################################################
+- name: Record That the Images Were Rebuilt
+  set_fact:
+    finetune_images_rebuilt: true
+  run_once: true

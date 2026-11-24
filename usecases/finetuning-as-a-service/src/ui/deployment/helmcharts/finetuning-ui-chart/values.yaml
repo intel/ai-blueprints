@@ -1,0 +1,65 @@
+# Default values for finetuning-ui
+replicaCount: 1
+
+image:
+  repository: localhost:5000/finetuning-ui
+  pullPolicy: Always
+  tag: "latest"
+
+imagePullSecrets: []
+nameOverride: ""
+fullnameOverride: ""
+
+service:
+  type: ClusterIP
+  port: 80
+  targetPort: 3000
+
+resources:
+  limits:
+    cpu: 500m
+    memory: 1Gi
+  requests:
+    cpu: 250m
+    memory: 512Mi
+
+autoscaling:
+  enabled: false
+  minReplicas: 1
+  maxReplicas: 3
+  targetCPUUtilizationPercentage: 80
+
+nodeSelector: {}
+
+tolerations: []
+
+affinity: {}
+
+# URL prefix the UI is served under. It must match the NEXT_PUBLIC_BASE_PATH the
+# image was built with.
+basePath: "/finetuning-as-a-service/ui"
+
+# Application specific settings
+app:
+  port: 3000
+
+  # Added ENV variables here
+  env:
+    - name: NEXT_PUBLIC_AUTH_URL
+      value: ""
+    - name: NEXT_PUBLIC_FILES_BASE_URL
+      value: ""
+    - name: NEXT_PUBLIC_DATAPREP_BASE_URL
+      value: ""
+    - name: NEXT_PUBLIC_FINETUNING_API_URL
+      value: ""
+    - name: NEXT_TELEMETRY_DISABLED
+      value: "1"
+    - name: NEXT_PUBLIC_BASE_PATH
+      value: ""
+    - name: NEXTAUTH_URL
+      value: ""
+    - name: NEXTAUTH_SECRET
+      value: ""
+  healthChecks:
+    enabled: false

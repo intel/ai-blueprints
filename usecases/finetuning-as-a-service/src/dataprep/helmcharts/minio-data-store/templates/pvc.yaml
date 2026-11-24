@@ -1,0 +1,22 @@
+{{- if .Values.persistence.enabled }}
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: {{ include "minio.fullname" . }}
+  annotations:
+    # Kept on `helm uninstall`: the data outlives the release.
+    helm.sh/resource-policy: keep
+  labels:
+    app: {{ include "minio.name" . }}
+    chart: {{ include "minio.chart" . }}
+    release: {{ .Release.Name }}
+spec:
+  accessModes:
+    - {{ .Values.persistence.accessMode }}
+  {{- if .Values.persistence.storageClass }}
+  storageClassName: {{ .Values.persistence.storageClass }}
+  {{- end }}
+  resources:
+    requests:
+      storage: {{ .Values.persistence.size }}
+{{- end }}

@@ -1,0 +1,65 @@
+# Copyright (C) 2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# What fine-tuned models are served with, in the inference namespace.
+#
+# Models are served by the platform's KServe: the Fine-Tuning API creates one
+# LLMInferenceService per deployed model from the serving profile published
+# here (src/api/app/kserve_serving.py), and the router's encoder is one too.
+# Base models are kept in the model store between deployments.
+###########################################################################
+
+- name: Create the Model Store
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: PersistentVolumeClaim
+      metadata:
+        name: "{{ finetune_model_store_claim }}"
+        namespace: "{{ finetune_inference_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: finetuning-as-a-service
+      spec: >-
+        {{ {'accessModes': ['ReadWriteOnce'],
+            'resources': {'requests': {'storage': finetune_model_store_size}}}
+           | combine({'storageClassName': finetune_model_store_class} if finetune_model_store_class | length > 0 else {}) }}
+
+# No token goes in here (this is a ConfigMap), so base models must be public.
+- name: Publish the Serving Profile
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: v1
+      kind: ConfigMap
+      metadata:
+        name: "{{ finetune_serving_profile_configmap }}"
+        namespace: "{{ finetune_inference_namespace }}"
+        labels:
+          app.kubernetes.io/part-of: finetuning-as-a-service
+      data:
+        profile.yaml: >-
+          {{ {'image': finetune_serving_image,
+              'args': finetune_serving_args,
+              'env': finetune_serving_env,
+              'kvCacheSpaceGib': finetune_serving_kv_cache_gib | int,
+              'maxLoraRank': finetune_serving_max_lora_rank | int,
+              'annotations': {'balloon.balloons.resource-policy.nri.io/container.main': finetune_serving_balloon},
+              'modelStore': {'claim': finetune_model_store_claim},
+              'fetch': {'image': dataprep_image_repository + ':' + dataprep_image_tag,
+                        'credentialsSecret': finetune_inference_minio_secret,
+                        'bucket': dataprep_minio_bucket},
+              'proxy': {'https': (env_proxy | default({})).https_proxy | default(''),
+                        'http': (env_proxy | default({})).http_proxy | default(''),
+                        'no': (env_proxy | default({})).no_proxy | default('')}}
+             | to_nice_yaml(indent=2) }}
+
+# Earlier versions served models with a Helm chart of their own, published here.
+- name: Remove the Model Chart of an Earlier Version
+  kubernetes.core.k8s:
+    state: absent
+    api_version: v1
+    kind: ConfigMap
+    name: vllm-chart
+    namespace: "{{ finetune_inference_namespace }}"

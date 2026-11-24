@@ -72,6 +72,7 @@ cluster (most endpoints are auto-discovered), and deploy.
       │   • coding-agent (LangGraph) │
       │   • customer-support-agent   │
       │   • deep-research-agent      │
+      │   • finetuning-as-a-service  │
       │   • (your use case here)     │
       └──────────────────────────────┘
 ```
@@ -145,6 +146,7 @@ in-cluster service URLs.
 | [coding-agent](usecases/coding-agent/) | Intel® Agent Toolkit | AI coding assistant (LangGraph) that writes and runs Python in Agent Sandbox pods; API-only (OpenAI-compatible `/v1/chat/completions` + `/v1/responses`, bearer token), host `coding-agent-langgraph.<base>` | 8090 (API) | [README](usecases/coding-agent/README.md) |
 | [customer-support-agent](usecases/customer-support-agent/) | Intel® Agent Toolkit | E-commerce support agent with 40 tools over a SQLite demo DB, RediSearch long-term memory (`bge-base-en` embeddings) and parallel tool execution; **no user auth**, host `customer-support-agent.<base>` | 8501 (Streamlit UI), 8502 (API) | [README](usecases/customer-support-agent/README.md) |
 | [deep-research-agent](usecases/deep-research-agent/) | Intel® Agent Toolkit | Autonomous web-research agent (LangGraph) that searches the web (Tavily key required), scores sources and writes a cited report, streamed over SSE; host `deep-research-agent.<base>` (+ optional `-dashboard`) | 8081 (UI + API), 8082 (dashboard) | [README](usecases/deep-research-agent/README.md) |
+| [finetuning-as-a-service](usecases/finetuning-as-a-service/) | Intel® Inference Toolkit | Fine-tune open models on your own data (uploads or Langfuse traces): train a LoRA adapter on GPU nodes or a separate GPU cluster, then serve it on its base model with KServe behind LiteLLM, optionally with a semantic route. Kubernetes only; sign-in through the platform Keycloak realm `platform`, so it needs Toolkit Manager `main` (not release-1.2) | `https://<base>/finetuning-as-a-service/ui` | [README](usecases/finetuning-as-a-service/README.md) |
 
 > **Categories** group blueprints by the primary capability they demonstrate
 > (e.g. `Intel® Agent Toolkit`, `Intel® Inference Toolkit`, `RAG`). Adding a use case? Pick or propose
@@ -254,7 +256,9 @@ and warns if the namespace is not yet in `litellm_allowed_namespaces`.
     │   └── ...
     ├── customer-support-agent/
     │   └── ...
-    └── deep-research-agent/
+    ├── deep-research-agent/
+    │   └── ...
+    └── finetuning-as-a-service/  # Fine-tuning UI/API/data prep + GPU training (Ansible + Helm, Kubernetes only)
         └── ...
 ```
 

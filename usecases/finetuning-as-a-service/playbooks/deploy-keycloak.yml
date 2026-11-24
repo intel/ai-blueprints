@@ -1,0 +1,174 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+###########################################################################
+# This use case's clients in the platform realm of the shared Keycloak.
+#
+# Included from deploy-all.yml before the routes that sign people in against
+# it. Keycloak, the realm (`platform`, the one realm people sign in to for every
+# platform UI) and its users belong to the platform (Toolkit Manager); this use case
+# only adds what is its own: the browser client its route signs people in with,
+# the client the API calls the engine with, and the group that may use it.
+###########################################################################
+
+# Also the check that it exists: Toolkit Manager always deploys it.
+- name: Wait for Keycloak to Be Ready
+  command: >-
+    kubectl -n {{ keycloak_namespace }} rollout status statefulset/{{ keycloak_statefulset }} --timeout=600s
+  changed_when: false
+
+###########################################################################
+# Clients and group, reconciled through the admin API:
+# created when absent, updated when present, so a run fixes a client changed
+# by hand. Other clients, users and AD/LDAP federation are left alone; people are
+# added to the group in the Keycloak admin console.
+#
+# The admin credentials are NOT passed in: they are already in the pod's
+# environment. The secrets are fed on stdin rather than as arguments so they do
+# not appear in the container's argv, where any process in the pod (and
+# `kubectl describe`-adjacent tooling on the node) could read them.
+###########################################################################
+# Identifiers are spliced into the in-pod script below, so they are held to a
+# safe alphabet; everything free-form goes over stdin instead.
+- name: Validate Keycloak Identifiers
+  assert:
+    that: item is match('^[A-Za-z0-9._-]+$')
+    fail_msg: "{{ item }} may only contain letters, digits, '.', '_' and '-'"
+    quiet: true
+  loop:
+    - "{{ keycloak_realm }}"
+    - "{{ oidc_client_id }}"
+    - "{{ nvidia_keycloak_client_id }}"
+    - "{{ finetune_users_group }}"
+    - "{{ cluster_url }}"
+
+- name: Reconcile the Clients and Group
+  shell: |
+    set -euo pipefail
+    printf '%s\n' {{ oidc_client_secret | quote }} {{ nvidia_keycloak_client_secret | quote }} | \
+    kubectl exec -n {{ keycloak_namespace }} -i statefulset/{{ keycloak_statefulset }} -- \
+      sh -euc '
+        read -r UI_SECRET
+        read -r ENGINE_SECRET
+        KCADM=/opt/keycloak/bin/kcadm.sh
+        CFG=/tmp/kcadm-$$.json
+        trap "rm -f $CFG" EXIT
+        REALM={{ keycloak_realm }}
+        HOST={{ cluster_url }}
+        UI={{ finetune_ui_base_path }}
+
+        "$KCADM" config credentials --config "$CFG" \
+          --server "http://localhost:8080{{ keycloak_relative_path }}" \
+          --realm master \
+          --user "$KC_BOOTSTRAP_ADMIN_USERNAME" \
+          --password "$KC_BOOTSTRAP_ADMIN_PASSWORD" >/dev/null
+
+        if ! "$KCADM" get "realms/$REALM" --config "$CFG" >/dev/null 2>&1; then
+          echo "MISSING_REALM"
+          exit 3
+        fi
+
+        # create-or-update one client; $1 = clientId, the rest are -s settings.
+        reconcile_client() {
+          CID="$1"; shift
+          ID=$("$KCADM" get clients --config "$CFG" -r "$REALM" \
+                 -q "clientId=$CID" --fields id --format csv --noquotes 2>/dev/null || true)
+          if [ -z "$ID" ]; then
+            "$KCADM" create clients --config "$CFG" -r "$REALM" -s "clientId=$CID" "$@" >/dev/null
+            echo "created client $CID"
+          else
+            "$KCADM" update "clients/$ID" --config "$CFG" -r "$REALM" "$@" >/dev/null
+            echo "updated client $CID"
+          fi
+        }
+
+        # Browser login, run by the platform gateway (Envoy) for this use
+        # case route: the callback and logout paths are under the UI. Envoy
+        # sends PKCE, and admits people by the groups claim in the ID token.
+        reconcile_client {{ oidc_client_id }} \
+          -s enabled=true -s protocol=openid-connect -s publicClient=false \
+          -s standardFlowEnabled=true -s implicitFlowEnabled=false \
+          -s directAccessGrantsEnabled=false -s serviceAccountsEnabled=false \
+          -s "redirectUris=[\"https://$HOST$UI/oauth2/callback\"]" \
+          -s "webOrigins=[]" \
+          -s "attributes.\"post.logout.redirect.uris\"=https://$HOST/##https://$HOST$UI/*" \
+          -s "attributes.\"pkce.code.challenge.method\"=S256" \
+          -s "secret=$UI_SECRET"
+        ID=$("$KCADM" get clients --config "$CFG" -r "$REALM" -q "clientId={{ oidc_client_id }}" \
+               --fields id --format csv --noquotes)
+        if ! "$KCADM" get "clients/$ID/protocol-mappers/models" --config "$CFG" -r "$REALM" \
+               --fields name --format csv --noquotes | grep -qx groups; then
+          "$KCADM" create "clients/$ID/protocol-mappers/models" --config "$CFG" -r "$REALM" \
+            -s name=groups -s protocol=openid-connect -s protocolMapper=oidc-group-membership-mapper \
+            -s "config.\"claim.name\"=groups" -s "config.\"full.path\"=false" \
+            -s "config.\"id.token.claim\"=true" -s "config.\"access.token.claim\"=true" \
+            -s "config.\"userinfo.token.claim\"=true" >/dev/null
+          echo "created groups claim"
+        fi
+
+        # Members may use the portal, as may the platform admins.
+        GROUP={{ finetune_users_group }}
+        GID=$("$KCADM" get groups --config "$CFG" -r "$REALM" -q "search=$GROUP" -q exact=true \
+                --fields id --format csv --noquotes 2>/dev/null | head -n1 || true)
+        if [ -z "$GID" ]; then
+          "$KCADM" create groups --config "$CFG" -r "$REALM" -s "name=$GROUP" >/dev/null
+          echo "created group $GROUP"
+        fi
+
+        # Machine-to-machine only: the Fine-Tuning API uses it with the
+        # client_credentials grant to call the engine, which accepts a token only
+        # when its azp is this client. No browser flow, so it cannot log a person
+        # in even if the secret leaks. Reasserted on update so a client loosened
+        # by hand in the console is pulled back to this shape.
+        reconcile_client {{ nvidia_keycloak_client_id }} \
+          -s enabled=true -s protocol=openid-connect -s publicClient=false \
+          -s standardFlowEnabled=false -s implicitFlowEnabled=false \
+          -s directAccessGrantsEnabled=false -s serviceAccountsEnabled=true \
+          -s "secret=$ENGINE_SECRET"
+      '
+  args:
+    executable: /bin/bash
+  register: keycloak_reconcile
+  changed_when: "'created' in keycloak_reconcile.stdout"
+  failed_when: keycloak_reconcile.rc != 0 and 'MISSING_REALM' not in keycloak_reconcile.stdout
+  no_log: true
+
+- name: Fail When the Platform Realm Is Missing
+  fail:
+    msg: >-
+      Realm {{ keycloak_realm }} is not in the shared Keycloak. People sign in to
+      every platform UI through it; it comes with Toolkit Manager
+      (intel/enterprise-ai-solutions#61, on main after release-1.2). Upgrade the platform, or set
+      keycloak_realm in {{ finetune_config_file }} to an existing realm.
+  when: "'MISSING_REALM' in keycloak_reconcile.stdout"
+
+# Proves the exact grant the Fine-Tuning API will use, against the exact endpoint
+# it will call. Cheaper to find a wrong secret here than as a 401 on the first
+# job submission, where it reads as an engine fault.
+- name: Verify Fine-Tuning Engine Client Can Obtain a Token
+  shell: |
+    set -euo pipefail
+    kubectl run keycloak-token-check-$RANDOM -n {{ keycloak_namespace }} --rm -i --restart=Never \
+      --image=curlimages/curl:8.10.1 --command -- \
+      curl -sf --max-time 20 -X POST \
+        "{{ keycloak_issuer_internal }}/protocol/openid-connect/token" \
+        -d grant_type=client_credentials \
+        -d client_id={{ nvidia_keycloak_client_id | quote }} \
+        --data-urlencode client_secret={{ nvidia_keycloak_client_secret | quote }} \
+      | grep -q access_token
+  args:
+    executable: /bin/bash
+  register: keycloak_token_check
+  retries: 5
+  delay: 5
+  until: keycloak_token_check.rc == 0
+  no_log: true
+
+- name: Show Keycloak Endpoints
+  debug:
+    msg:
+      - "=============================================================="
+      - "Sign-in: realm {{ keycloak_realm }} of the shared Keycloak, client {{ oidc_client_id }}."
+      - "  Admitted      : groups {{ finetune_allowed_groups | join(', ') }}"
+      - "  Admin console : {{ keycloak_public_url }}{{ keycloak_relative_path }}/admin/"
+      - "  Issuer        : {{ keycloak_issuer }}"
+      - "=============================================================="
