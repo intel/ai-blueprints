@@ -1,0 +1,7 @@
+# Operator config: holds engine credentials and site-specific addresses.
+# Copy finetune-config.cfg.example to finetune-config.cfg and fill it in.
+finetune-config.cfg
+
+# Helm templates that render Secrets from values. They carry no secret material
+# themselves, but the root .gitignore's *-secret.yaml rule would drop them.
+!**/templates/*-secret.yaml

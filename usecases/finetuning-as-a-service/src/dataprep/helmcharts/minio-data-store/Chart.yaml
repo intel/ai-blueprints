@@ -1,0 +1,12 @@
+apiVersion: v2
+name: minio
+description: S3 object storage for Data Prep (SeaweedFS; the release keeps the MinIO name)
+type: application
+version: 0.2.0
+appVersion: "4.37"
+keywords:
+  - storage
+  - object-storage
+  - s3
+maintainers:
+  - name: Your Team

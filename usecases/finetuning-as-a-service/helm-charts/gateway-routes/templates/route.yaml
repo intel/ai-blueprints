@@ -1,0 +1,88 @@
+{{- /* Copyright (C) 2026 Intel Corporation */ -}}
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- $v := .Values }}
+# Every page and API of the use case, behind one sign-in. One route, so one
+# SecurityPolicy and one set of session cookies: the browser calls the API and
+# Data Prep with the session it got on the UI.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: finetuning-as-a-service
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "routes.labels" . | nindent 4 }}
+spec:
+  {{- include "routes.parentRefs" . | nindent 2 }}
+  rules:
+    # The UI is built with its base path, so it is passed on unchanged. The
+    # OIDC callback and logout paths are under it, so they hit this route.
+    - matches:
+        - path:
+            type: PathPrefix
+            value: {{ $v.ui.basePath }}
+      filters:
+        {{- include "routes.dropForged" (dict) | nindent 8 }}
+      {{- include "routes.backend" (dict "b" $v.ui "ns" .Release.Namespace) | nindent 6 }}
+    {{- include "routes.rule" (dict "root" . "from" "/v1/fine_tuning" "to" "/v1/fine_tuning" "b" $v.api) | nindent 4 }}
+    {{- include "routes.rule" (dict "root" . "from" "/v1/models" "to" "/v1/models" "b" $v.api) | nindent 4 }}
+    {{- include "routes.rule" (dict "root" . "from" "/v1/files" "to" "/v1/files" "b" $v.dataprep) | nindent 4 }}
+    {{- include "routes.rule" (dict "root" . "from" "/v1/dataprep" "to" "/v1/dataprep" "b" $v.dataprep) | nindent 4 }}
+    {{- include "routes.rule" (dict "root" . "from" "/v1/langfuse" "to" "/v1/langfuse" "b" $v.dataprep) | nindent 4 }}
+---
+# A training pod has no browser session: it presents its job token, which Data
+# Prep verifies and scopes to that job's files and its model upload. A header
+# match outranks the signed-in route on the same path, so only requests that
+# carry a job token come here, and none of them can claim a user by header.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: finetuning-as-a-service-jobs
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "routes.labels" . | nindent 4 }}
+spec:
+  {{- include "routes.parentRefs" . | nindent 2 }}
+  rules:
+    {{- range list "GET" "POST" }}
+    - matches:
+        - path:
+            type: PathPrefix
+            value: {{ $v.basePath }}/v1/files
+          method: {{ . }}
+          headers:
+            - name: Authorization
+              type: RegularExpression
+              value: "^Bearer ftjob_.+$"
+      filters:
+        {{- include "routes.dropForged" (dict "withUser" true) | nindent 8 }}
+        - type: URLRewrite
+          urlRewrite:
+            path:
+              type: ReplacePrefixMatch
+              replacePrefixMatch: /v1/files
+      {{- include "routes.backend" (dict "b" $v.dataprep "ns" $.Release.Namespace) | nindent 6 }}
+    {{- end }}
+---
+# Health checks and the API docs, open as before.
+apiVersion: gateway.networking.k8s.io/v1
+kind: HTTPRoute
+metadata:
+  name: finetuning-as-a-service-public
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "routes.labels" . | nindent 4 }}
+spec:
+  {{- include "routes.parentRefs" . | nindent 2 }}
+  rules:
+    {{- range list "health" "liveness" "readiness" "openapi.json" }}
+    {{- include "routes.rule" (dict "root" $ "from" (printf "/api/%s" .) "to" (printf "/api/%s" .) "b" $v.api "exact" true "public" true) | nindent 4 }}
+    {{- end }}
+    {{- range list "docs" "redoc" }}
+    {{- include "routes.rule" (dict "root" $ "from" (printf "/api/%s" .) "to" (printf "/api/%s" .) "b" $v.api "public" true) | nindent 4 }}
+    {{- end }}
+    {{- range list "health" "openapi.json" }}
+    {{- include "routes.rule" (dict "root" $ "from" (printf "/dataprep/%s" .) "to" (printf "/%s" .) "b" $v.dataprep "exact" true "public" true) | nindent 4 }}
+    {{- end }}
+    {{- range list "docs" "redoc" }}
+    {{- include "routes.rule" (dict "root" $ "from" (printf "/dataprep/%s" .) "to" (printf "/%s" .) "b" $v.dataprep "public" true) | nindent 4 }}
+    {{- end }}

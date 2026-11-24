@@ -1,0 +1,38 @@
+# Fine-Tuning Service Dependencies
+# Pinned versions for reproducible builds and security
+# Last updated: 2026-02-06 - Security vulnerabilities patched
+
+# FastAPI Framework - Latest stable versions
+fastapi==0.115.0
+uvicorn[standard]==0.32.0
+python-multipart==0.0.30  # HIGH CVEs fixed in 0.0.27 / 0.0.30 (Trivy)
+
+# Database
+asyncpg==0.29.0
+
+# HTTP Client
+httpx==0.27.2
+
+# Security & Authentication (Keycloak OIDC)
+PyJWT[crypto]==2.14.0  # CRITICAL/HIGH auth-bypass CVEs fixed in 2.13.0 / 2.14.0 (Trivy)
+cryptography==50.0.0  # HIGH CVEs fixed in 48.0.1 / 50.0.0 (Trivy)
+
+# Data Validation
+pydantic==2.9.2
+pydantic-settings==2.6.1
+
+# Rate Limiting & Security
+slowapi==0.1.9
+
+# Utilities
+python-dotenv==1.0.1
+
+# Observability - Lightweight monitoring (optional, configurable)
+structlog==24.4.0  # Structured JSON logging
+prometheus-client==0.21.0  # Already installed, pinned for metrics
+psutil==6.1.1  # System metrics (CPU, memory)
+
+
+# Reading the serving profile, so a deployment and the deploy dialog use the
+# defaults the install published rather than a second copy of them.
+PyYAML==6.0.2

@@ -39,6 +39,7 @@ Current use cases (directory = namespace; host in parentheses):
 - `coding-agent` (`coding-agent-langgraph.<base>`, release `coding-agent-langgraph`): LangGraph, Agent Sandbox code execution, API-only with a Bearer `DEVUI_AUTH_TOKEN`.
 - `customer-support-agent` (`customer-support-agent.<base>`): Streamlit UI at `/`, FastAPI at `/api`+`/v1`, SQLite demo data, RediSearch memory with the `bge-base-en` embedding model. It has **no user auth**.
 - `deep-research-agent` (`deep-research-agent.<base>`, optional `-dashboard` host): LangGraph web research; needs `TAVILY_API_KEY`; SQLite on a PVC; 3600s route timeout for SSE.
+- `finetuning-as-a-service` (`<base>/finetuning-as-a-service/*` on the apex host; fixed namespaces `dataprep`, `finetuning-api`, `finetuning-engine`, `finetuning-ui`, `finetuning-models`, `ftaas`): fine-tuning UI/API/data prep plus LoRA training Jobs on GPU nodes or a separate GPU cluster; models served by KServe behind LiteLLM. Kubernetes only, deployed with Ansible + Helm (`deploy.sh` reads `finetune-config.cfg`). Needs only the `inference` layer and, unlike the others, Keycloak: sign-in is the platform gateway's SSO against realm `platform`, which is on Toolkit Manager `main` (after release-1.2).
 
 `customer-support-agent` and `deep-research-agent` read `LLM_BASE_URL`/`LLM_API_KEY`/`LLM_MODEL`. Their
 deploy.sh maps the dispatcher's `OPENAI_BASE_URL`/`OPENAI_API_KEY`/`MODEL_NAME` onto those.

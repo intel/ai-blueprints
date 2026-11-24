@@ -1,0 +1,114 @@
+{{- /* Copyright (C) 2026 Intel Corporation */ -}}
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- $s := .Values.sso }}
+{{- $oidc := printf "%s/protocol/openid-connect" (required "sso.issuerInternal is required" $s.issuerInternal) }}
+{{- $ui := printf "https://%s%s" .Values.host .Values.ui.basePath }}
+# Same shape as Toolkit Manager's gateway SSO (roles/gateway route_sso):
+# a route-level policy replaces the Gateway-wide JWT check with an OIDC login
+# against the platform realm, so one sign-in covers every platform UI.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: finetuning-as-a-service-sso
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "routes.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: finetuning-as-a-service
+  oidc:
+    provider:
+      issuer: {{ required "sso.issuer is required" $s.issuer | quote }}
+      authorizationEndpoint: "{{ $s.issuer }}/protocol/openid-connect/auth"
+      endSessionEndpoint: "{{ $s.issuer }}/protocol/openid-connect/logout"
+      tokenEndpoint: "{{ $oidc }}/token"
+    clientID: {{ $s.clientId | quote }}
+    clientSecret:
+      name: finetuning-as-a-service-sso
+    redirectURL: "{{ $ui }}/oauth2/callback"
+    # The UI's sign-out already goes here.
+    logoutPath: "{{ .Values.ui.basePath }}/logout"
+    refreshToken: true
+    cookieNames:
+      idToken: finetuning-as-a-service-id
+      accessToken: finetuning-as-a-service-at
+    # The UI's background calls get a 401 when the session has ended, rather
+    # than a redirect to Keycloak that fetch() cannot follow.
+    denyRedirect:
+      headers:
+        - name: Sec-Fetch-Mode
+          type: Exact
+          value: cors
+  jwt:
+    providers:
+      - name: sso
+        issuer: {{ $s.issuer | quote }}
+        audiences: [{{ $s.clientId | quote }}]
+        remoteJWKS:
+          uri: "{{ $oidc }}/certs"
+        extractFrom:
+          cookies: [finetuning-as-a-service-id]
+        claimToHeaders:
+          - claim: {{ $s.usernameClaim }}
+            header: X-Forwarded-User
+  authorization:
+    defaultAction: Deny
+    rules:
+      - name: allowed-groups
+        action: Allow
+        principal:
+          jwt:
+            provider: sso
+            claims:
+              - name: groups
+                valueType: StringArray
+                values: {{ $s.allowedGroups | toJson }}
+---
+{{- range list "jobs" "public" }}
+# No sign-in here (see route.yaml); without a policy of its own the route would
+# get the Gateway-wide JWT check.
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: SecurityPolicy
+metadata:
+  name: finetuning-as-a-service-{{ . }}-no-sso
+  namespace: {{ $.Release.Namespace }}
+  labels:
+    {{- include "routes.labels" $ | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: finetuning-as-a-service-{{ . }}
+---
+{{- end }}
+apiVersion: gateway.envoyproxy.io/v1alpha1
+kind: BackendTrafficPolicy
+metadata:
+  name: finetuning-as-a-service-timeout
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "routes.labels" . | nindent 4 }}
+spec:
+  targetRefs:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: finetuning-as-a-service
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      name: finetuning-as-a-service-jobs
+  timeout:
+    http:
+      requestTimeout: {{ .Values.platformGateway.requestTimeout }}
+---
+apiVersion: v1
+kind: Secret
+metadata:
+  name: finetuning-as-a-service-sso
+  namespace: {{ .Release.Namespace }}
+  labels:
+    {{- include "routes.labels" . | nindent 4 }}
+type: Opaque
+stringData:
+  client-secret: {{ required "sso.clientSecret is required" $s.clientSecret | quote }}

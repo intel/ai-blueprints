@@ -1,0 +1,272 @@
+# Fine-Tuning Service Configuration
+
+# Application settings
+app:
+  name: finetuning-service
+  replicaCount: 2  # Minimum 2 for zero-downtime deployments
+  image:
+    repository: registry.kube-system.svc.cluster.local:5000/finetuning-service
+    tag: "latest"
+    pullPolicy: Always
+
+  # Image pull secrets for private registry (not needed for insecure local registry)
+  # imagePullSecrets:
+  #   - name: registry-secret
+
+  service:
+    type: ClusterIP
+    port: 8000
+
+  # Resource limits
+  resources:
+    requests:
+      memory: "512Mi"
+      cpu: "500m"
+    limits:
+      memory: "2Gi"
+      cpu: "2000m"
+
+  # Pod termination grace period
+  terminationGracePeriodSeconds: 60
+
+  # Environment configuration
+  config:
+    # Nvidia/Unsloth API Configuration
+    # REQUIRED: Set to your training backend URL (Nvidia APIs on port 8443)
+    nvidiaApiUrl: ""  # e.g., "https://your-training-backend.com:8443"
+    nvidiaKeycloakVerifySsl: "true"  # Whether to verify SSL when calling Keycloak
+    enableNvidia: "true"
+
+    # Rate Limiting Configuration
+    # Enable/disable rate limiting globally
+    rateLimitEnabled: "true"
+    # Default rate limit for all endpoints (requests per minute)
+    rateLimitDefault: "200"
+    # Health check endpoints (lightweight operations)
+    rateLimitHealth: "100"
+    # Model list/retrieve endpoints (read operations)
+    rateLimitModels: "100"
+    # Job creation endpoint (resource-intensive)
+    rateLimitJobCreate: "10"
+    # Job listing/retrieve endpoints
+    rateLimitJobRead: "60"
+    # Job cancellation endpoint
+    rateLimitJobCancel: "20"
+    # Job events endpoint
+    rateLimitJobEvents: "60"
+
+    # Observability Configuration (Lightweight monitoring)
+    # Enable/disable observability features (adds ~5-10MB per pod)
+    observabilityEnabled: "true"
+    # Use JSON structured logging (recommended for production)
+    observabilityJsonLogs: "true"
+    # Track user actions in metrics
+    observabilityLogUserActions: "true"
+    # Enable Prometheus metrics endpoint
+    observabilityMetricsEnabled: "true"
+    # Track per-user request metrics
+    observabilityTrackUserMetrics: "true"
+    # Collect system metrics (CPU, memory)
+    observabilityCollectSystemMetrics: "true"
+
+# ServiceAccount the API pods run as. A dedicated one is needed because it is
+# granted permission to deploy fine-tuned models in the inference namespace.
+serviceAccount:
+  create: true
+  name: ""
+  annotations: {}
+
+# Deploying a fine-tuned model from the UI.
+#
+# "Deploy Model" serves a job's adapter with the platform's KServe: the API
+# creates an LLMInferenceService in the namespace below and registers the model
+# with the gateway once it answers.
+modelDeployment:
+  enabled: true
+  # Namespace models are served in, as KServe LLMInferenceServices.
+  namespace: finetuning-models
+  # ConfigMap there holding the serving profile (image, vLLM flags, CPU
+  # placement, model store), published by the deploy.
+  profileConfigMap: finetuning-serving
+  # Create the Role and RoleBinding for the above.
+  rbac:
+    create: true
+  # 0 means no cap on how many models are served at once: a count says nothing
+  # about cost, so admission is decided by the CPU and memory check against real
+  # node capacity. Set a positive number for a hard ceiling regardless of size.
+  maxDeployments: 0
+  # Pre-flight capacity check: reads node allocatable and the requests already
+  # reserved on each node, so the UI can show what is free and a deploy that
+  # cannot be placed is refused instead of being admitted onto a full node.
+  #
+  # This is the chart's only cluster-scoped RBAC (read-only on nodes, and pods
+  # across namespaces). Set enabled=false to drop that grant: the check then
+  # reports "capacity unknown" and deployment behaves as it did before.
+  capacity:
+    enabled: true
+  # Sizing for a deployed model, set as its requests and limits: these are what
+  # stop a model being placed on a node with nothing left. The default is derived from the base model's
+  # parameter count and is editable per-deploy in the UI.
+  sizing:
+    cpuCoresPerBillionParams: 4
+    # Weights and working memory only. The KV cache is a separate term, because
+    # vLLM reserves VLLM_CPU_KVCACHE_SPACE up front whatever the model's size --
+    # folding it into a per-parameter figure under-sizes small models, which is an
+    # OOM kill during load rather than a slow model.
+    memoryGibPerBillionParams: 3
+    memoryOverheadGib: 8
+    # Assumed KV cache reservation when the serving profile cannot be read; the
+    # live value is the profile's kvCacheSpaceGib.
+    defaultKvCacheSpaceGib: 8
+    # Used when the parameter count cannot be read from the model id.
+    defaultCpuCores: 16
+    defaultMemoryGib: 16
+    # Floor used only when the parameter count cannot be read from the model id.
+    minCpuCores: 2
+    minMemoryGib: 8
+    # Otherwise the floor is derived from the model, which is what stops a 3B
+    # model being configured with 1 core and 1Gi:
+    #   memory >= params_B * minMemoryGibPerBillionParams   (2Gi/B at bf16)
+    #             + VLLM_CPU_KVCACHE_SPACE                  (reserved up front)
+    #             + minMemoryOverheadGib
+    #   cpu    >= params_B * minCpuCoresPerBillionParams
+    # The memory floor is a hard requirement (below it the pod is OOM-killed
+    # while loading); the CPU floor only stops a deployment being made unusably
+    # slow. Both are shown in the deploy form with their arithmetic.
+    minMemoryGibPerBillionParams: 2
+    minCpuCoresPerBillionParams: 1
+    minMemoryOverheadGib: 2
+    # A sanity backstop, not the ceiling users see: the real maximum offered is
+    # the roomiest schedulable node's allocatable, since a pod runs on one node.
+    # Keep these above the largest node, or they silently clip it.
+    maxCpuCores: 1024
+    maxMemoryGib: 8192
+    # Largest share of one node a single deployment may request. Shapes the
+    # recommendation only -- a deliberate larger request is still allowed, up to
+    # node allocatable, because refusing it just invites the force flag.
+    maxNodeFraction: 0.5
+  # Allow deploying anyway when the request does not fit. The check is a snapshot
+  # and vLLM's real appetite is not exactly its request, so the refusal is
+  # overridable — overrides are logged.
+  allowCapacityOverride: true
+
+# The Data Prep service, which owns the files API. The API needs it to validate a
+# training file at submission time and to read that file back when extracting
+# router utterances from it. With this unset, submit-time validation is silently
+# skipped -- the code guards on the URL being present.
+dataprep:
+  url: "http://data-prep-backend.dataprep.svc.cluster.local:8000"
+
+# LiteLLM, from the Intel® Inference Toolkit (inference layer). Needed to read which
+# models are registered and, for semantic routing, to create and update the
+# auto-router entry. The master key secret is published in this namespace by
+# playbooks/deploy-all.yml; referencing it here keeps one copy.
+gateway:
+  enabled: true
+  namespace: litellm
+  port: 4000
+  url: "http://litellm.litellm.svc.cluster.local:4000"
+  masterKeySecret:
+    name: "genai-gateway-master-key"
+    key: "LITELLM_MASTER_KEY"
+  # One router shared by every fine-tuned model: callers point at this name and
+  # routes accumulate, highest score wins.
+  routerName: "smart"
+  # An auto-router is cached in the gateway process by model name and is not
+  # refreshed by re-registering it, so applying a change restarts the gateway.
+  # Setting this false grants no restart RBAC; the API then reports that a change
+  # is saved but not yet live.
+  restartOnApply: true
+  deployment: "litellm"
+
+# URL prefix the API is served under on the platform gateway.
+basePath: "/finetuning-as-a-service"
+
+# Secrets Configuration
+# These should be set via --set flags or a separate values file
+secrets:
+  # Database URL (REQUIRED)
+  # Format: postgresql://<user>:<password>@<host>:<port>/<database>
+  databaseUrl: ""
+
+  # Keycloak OAuth2 Configuration for Nvidia Backend (REQUIRED)
+  # These should be provided via --set flags during deployment
+  nvidiaKeycloakTokenUrl: ""      # e.g., "https://keycloak.example.com:8444/realms/nvidia/protocol/openid-connect/token"
+  nvidiaKeycloakClientId: ""       # e.g., "finetune-api-client"
+  nvidiaKeycloakClientSecret: ""   # Client secret from Keycloak
+
+  # Signs the per-job token the training pod uses against the Data Prep files
+  # API; Data Prep gets the same value (FILES_JOB_TOKEN_SECRET).
+  filesJobTokenSecret: ""
+
+# Autoscaling Configuration
+autoscaling:
+  enabled: true  # Enable HPA for production
+  minReplicas: 2
+  maxReplicas: 10
+  targetCPUUtilizationPercentage: 70
+  targetMemoryUtilizationPercentage: 80
+  scaleDownStabilizationWindowSeconds: 300
+  scaleUpStabilizationWindowSeconds: 0
+
+# Pod Disruption Budget
+podDisruptionBudget:
+  enabled: true
+  minAvailable: 1  # Keep at least 1 pod available during disruptions
+  # maxUnavailable: 1  # Alternative: allow max 1 pod to be unavailable
+
+# Network Policy
+# Network Policy Configuration
+networkPolicy:
+  enabled: true
+  # Istio ambient: also allow ztunnel's HBONE port (15008) and the kubelet probe
+  # source (169.254.7.127), or the mesh resets every allowed connection.
+  ambientMesh: false
+  ingress:
+    # The platform Gateway's Envoy proxies, which publish this API. Matched by
+    # namespace AND pod labels: labels alone could be copied by any pod.
+    gateway:
+      name: eg-gateway
+      namespace: envoy-gateway-system
+      controllerNamespace: envoy-gateway-system
+    fromNamespaces: []
+    fromPodLabels: {}
+  egress:
+    # The Kubernetes API server's real port. The API installs, reads and
+    # removes model deployments through it; policies see the endpoint after
+    # the kubernetes Service's 443 is translated, so 443 alone is not enough.
+    apiServerPorts:
+      - 6443
+
+# Security Context
+securityContext:
+  enabled: true
+  runAsNonRoot: true
+  runAsUser: 1000
+  fsGroup: 1000
+  readOnlyRootFilesystem: false  # Set to true if app doesn't need to write to filesystem
+  allowPrivilegeEscalation: false
+  capabilities:
+    drop:
+      - ALL
+
+# Probes Configuration
+probes:
+  startup:
+    enabled: true
+    initialDelaySeconds: 0
+    periodSeconds: 5
+    timeoutSeconds: 3
+    failureThreshold: 30  # 30 * 5s = 150s max startup time
+  liveness:
+    enabled: true
+    initialDelaySeconds: 10
+    periodSeconds: 30
+    timeoutSeconds: 10
+    failureThreshold: 3
+  readiness:
+    enabled: true
+    initialDelaySeconds: 5
+    periodSeconds: 10
+    timeoutSeconds: 5
+    failureThreshold: 3

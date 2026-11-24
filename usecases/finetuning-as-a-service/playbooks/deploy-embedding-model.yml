@@ -1,0 +1,152 @@
+# Copyright (C) 2025-2026 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+---
+###########################################################################
+# Deploy the embedding model the semantic router encodes with
+#
+# LiteLLM's auto-router requires an embedding model registered in the gateway
+# (auto_router_embedding_model): it encodes the route utterances once and every
+# incoming query thereafter. Without one, a router cannot be created at all.
+#
+# Served like the fine-tuned models, as a KServe LLMInferenceService on the
+# serving profile's image (see deploy-serving.yml); the Fine-Tuning API
+# registers it with the gateway once it answers. Two settings are not obvious
+# and were each found the hard way:
+#
+#   * --gpu-memory-utilization, because on the CPU backend that flag is the
+#     fraction of the *container limit* vLLM reserves, and the 0.92 default fails
+#     on a small limit once container overhead is counted;
+#   * encoding_format=float in the gateway registration (the API sets it for an
+#     embedding model), because LiteLLM sends that field as null when a caller
+#     omits it and vLLM rejects null, which breaks the router on its first encode.
+###########################################################################
+
+# The base model goes into the model store once; KServe mounts it from there.
+- name: Deploy the Embedding Model
+  kubernetes.core.k8s:
+    state: present
+    definition:
+      apiVersion: serving.kserve.io/v1alpha2
+      kind: LLMInferenceService
+      metadata:
+        name: "{{ finetune_embedding_name }}"
+        namespace: "{{ finetune_inference_namespace }}"
+        labels:
+          app.kubernetes.io/managed-by: finetuning-service
+          finetuning.intel.com/role: router-encoder
+        annotations:
+          finetuning.intel.com/served-model-name: "{{ finetune_embedding_model }}"
+          finetuning.intel.com/gateway-mode: embedding
+      spec:
+        annotations:
+          balloon.balloons.resource-policy.nri.io/container.main: "{{ finetune_serving_balloon }}"
+        model:
+          uri: "pvc://{{ finetune_model_store_claim }}/models/{{ finetune_embedding_model | replace('/', '--') }}"
+          name: "{{ finetune_embedding_model }}"
+        replicas: 1
+        template:
+          initContainers:
+            - name: fetch-base-model
+              image: "{{ finetune_serving_image }}"
+              command:
+                - python3
+                - -c
+                - |
+                  import os, sys
+                  from huggingface_hub import snapshot_download
+                  repo, dest = sys.argv[1:3]
+                  if os.path.isfile(os.path.join(dest, ".complete")):
+                      print(f"[fetch-base-model] {repo} is already in the model store"); sys.exit(0)
+                  snapshot_download(repo, local_dir=dest, max_workers=4,
+                                    allow_patterns=["*.json", "*.safetensors", "*.txt", "*.model"])
+                  open(os.path.join(dest, ".complete"), "w").close()
+                  print(f"[fetch-base-model] {repo} downloaded")
+                - "{{ finetune_embedding_model }}"
+                - "/store/models/{{ finetune_embedding_model | replace('/', '--') }}"
+              env: >-
+                {{ [{'name': 'HOME', 'value': '/tmp'}, {'name': 'HF_HOME', 'value': '/tmp/hf'},
+                    {'name': 'HF_HUB_DISABLE_XET', 'value': '1'}]
+                   + ([{'name': 'HTTPS_PROXY', 'value': env_proxy.https_proxy},
+                       {'name': 'HTTP_PROXY', 'value': env_proxy.http_proxy or env_proxy.https_proxy},
+                       {'name': 'NO_PROXY', 'value': env_proxy.no_proxy}]
+                      if (env_proxy | default({})).https_proxy | default('') | length > 0 else []) }}
+              volumeMounts:
+                # KServe's own volume for the pvc:// model: a second volume
+                # naming the same claim would never finish mounting.
+                - {name: kserve-pvc-source, mountPath: /store}
+                - {name: fetch-tmp, mountPath: /tmp}
+              resources:
+                requests: {cpu: 500m, memory: 512Mi}
+                limits: {cpu: "2", memory: 4Gi}
+              securityContext: &restricted
+                allowPrivilegeEscalation: false
+                capabilities: {drop: [ALL]}
+                runAsNonRoot: true
+                runAsUser: 1000
+                runAsGroup: 1000
+                seccompProfile: {type: RuntimeDefault}
+          containers:
+            - name: main
+              image: "{{ finetune_serving_image }}"
+              args: ["--dtype", "bfloat16", "--gpu-memory-utilization", "0.5"]
+              env: "{{ finetune_serving_env | dict2items(key_name='name', value_name='value') }}"
+              resources:
+                requests: {cpu: "{{ finetune_embedding_cpu }}", memory: "{{ finetune_embedding_memory }}"}
+                limits: {cpu: "{{ finetune_embedding_cpu }}", memory: "{{ finetune_embedding_memory }}"}
+              startupProbe:
+                httpGet: {path: /health, port: 8000}
+                failureThreshold: 120
+                periodSeconds: 10
+              readinessProbe:
+                httpGet: {path: /health, port: 8000}
+                failureThreshold: 5
+                periodSeconds: 10
+                timeoutSeconds: 5
+              securityContext: *restricted
+          volumes:
+            - name: fetch-tmp
+              emptyDir: {sizeLimit: 4Gi}
+          securityContext:
+            seccompProfile: {type: RuntimeDefault}
+  run_once: true
+
+- name: Wait for the Embedding Model to Load
+  kubernetes.core.k8s_info:
+    api_version: serving.kserve.io/v1alpha2
+    kind: LLMInferenceService
+    name: "{{ finetune_embedding_name }}"
+    namespace: "{{ finetune_inference_namespace }}"
+  register: finetune_embedding_status
+  until: >-
+    (finetune_embedding_status.resources | first | default({})).status.conditions | default([])
+    | selectattr('type', 'eq', 'Ready') | selectattr('status', 'eq', 'True') | list | length > 0
+  retries: "{{ (finetune_embedding_timeout | int / 10) | int }}"
+  delay: 10
+  run_once: true
+
+# Earlier versions served it with a Helm chart of their own. Without its hooks:
+# the one it has removes the model from LiteLLM, with a key no longer kept here,
+# and the API's registration replaces that entry anyway (same name).
+- name: Remove the Embedding Release of an Earlier Version
+  shell: |
+    set -euo pipefail
+    if helm status vllm-bge-embedding -n {{ finetune_inference_namespace }} >/dev/null 2>&1; then
+      helm uninstall vllm-bge-embedding -n {{ finetune_inference_namespace }} --no-hooks --wait
+      echo removed
+    fi
+    kubectl -n {{ finetune_inference_namespace }} delete pvc vllm-bge-embedding-pvc --ignore-not-found --wait=false
+  args:
+    executable: /bin/bash
+  register: finetune_embedding_old
+  changed_when: "'removed' in finetune_embedding_old.stdout"
+  run_once: true
+
+- name: Report the Embedding Model
+  debug:
+    msg:
+      - "=============================================="
+      - "Embedding model: {{ finetune_embedding_model }}"
+      - "Served as LLMInferenceService {{ finetune_inference_namespace }}/{{ finetune_embedding_name }}."
+      - "The Fine-Tuning API registers it with the gateway as mode=embedding."
+      - "=============================================="
+  run_once: true

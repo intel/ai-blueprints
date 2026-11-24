@@ -1,0 +1,356 @@
+---
+# Copyright (C) 2024-2025 Intel Corporation
+# SPDX-License-Identifier: Apache-2.0
+
+##############################################################################
+# FineTuning-as-a-Service - Internal Variables
+##############################################################################
+# Internal implementation variables. Operator settings live in finetune-config.cfg.
+# Users should not need to modify these values directly.
+# The plugin deploys three components:
+#   1. Fine-Tuning API (middleware)
+#   2. Data Preparation Service (dataprep)
+#   3. Fine-Tuning UI (frontend)
+##############################################################################
+
+# =============================================================================
+# Global Configuration
+# =============================================================================
+# Root of this use case. Every path below is relative to it, so the playbooks
+# run the same from any working directory.
+finetune_plugin_path: "{{ playbook_dir | dirname }}"
+
+# Operator configuration. deploy.sh passes --config through as this variable.
+finetune_config_file: "{{ finetune_plugin_path }}/finetune-config.cfg"
+
+# Registry the images are built into and pulled from. The default is the
+# in-cluster registry Kubespray deploys; set finetune_registry in
+# finetune-config.cfg to use another one.
+finetune_registry_default: registry.kube-system.svc.cluster.local:5000
+
+# URL prefix on the cluster host every page and API of this use case is served
+# under (UI at <prefix>/ui, API at <prefix>/api, files at <prefix>/v1/files).
+# LiteLLM keeps "/" on the same host. Changing it needs an image rebuild (the
+# UI bakes it in), and moves the OIDC redirect URIs with it.
+finetune_url_prefix: /finetuning-as-a-service
+
+# Each component deploys to its own namespace
+finetune_api_namespace: finetuning-api
+finetune_engine_namespace: finetuning-engine
+dataprep_namespace: dataprep
+finetune_ui_namespace: finetuning-ui
+
+finetune_tls_enabled: true
+finetune_persistence_storage_class: local-path
+
+# =============================================================================
+# Fine-Tuning API Configuration
+# =============================================================================
+finetune_api_name: finetuning-service
+finetune_api_replica_count: 1
+finetune_api_image_repository: "{{ finetune_registry }}/finetuning-service"
+finetune_api_image_tag: latest
+finetune_api_image_pull_policy: Always
+finetune_api_service_port: "8000"
+finetune_api_base_path: "{{ finetune_url_prefix }}"
+
+# API Resources
+finetune_api_cpu_request: 500m
+finetune_api_memory_request: 512Mi
+finetune_api_cpu_limit: 2
+finetune_api_memory_limit: 2Gi
+
+# API PostgreSQL Configuration
+finetune_api_postgres_enabled: true
+finetune_api_postgres_port: "5432"
+finetune_api_postgres_database: finetuning
+finetune_api_postgres_username: finetuning
+finetune_api_postgres_storage_size: 10Gi
+finetune_api_postgres_version: "15"
+
+# =============================================================================
+# Fine-Tuning Engine Configuration
+# =============================================================================
+# The engine is the component that actually trains. It runs in this cluster as an
+# ordinary HTTP service with no GPU, and turns each request into one Kubernetes
+# Job on the GPU cluster (see finetune_engine_train_* below). The Fine-Tuning API
+# is its only caller and reaches it over the in-cluster Service, so nothing about
+# the engine is published through the gateway.
+finetune_engine_name: finetuning-engine
+# One replica, not a placeholder: live progress, cancellation flags and the GPU
+# slot pool are in-process state. See the chart's values.yaml.
+finetune_engine_replica_count: 1
+finetune_engine_image_repository: "{{ finetune_registry }}/finetuning-engine"
+finetune_engine_image_tag: latest
+finetune_engine_image_pull_policy: Always
+finetune_engine_service_port: "8000"
+
+# Engine Resources. Sized for an HTTP service that streams pod logs.
+finetune_engine_cpu_request: 500m
+finetune_engine_memory_request: 512Mi
+finetune_engine_cpu_limit: "2"
+finetune_engine_memory_limit: 2Gi
+
+# Engine PostgreSQL. The engine creates its own schema on startup, so unlike the
+# API there is no init-db.sql step.
+finetune_engine_postgres_port: "5432"
+finetune_engine_postgres_database: finetune_engine
+finetune_engine_postgres_username: finetuning
+finetune_engine_postgres_storage_size: 10Gi
+# Release name, which is also the Service name the engine connects to. It
+# contains the Postgres chart's own name, so helm does not prefix it again.
+finetune_engine_postgres_release: finetuning-engine-postgresql
+
+# Admission. The effective concurrency is the smaller of this and the GPU quota
+# on the training namespace, so raising it alone changes nothing.
+finetune_engine_max_concurrent_jobs: 2
+finetune_engine_gpu_memory_threshold_gb: 20
+
+# ── Training log store ───────────────────────────────────────────────────────
+# The GPU cluster is scratch. Its training Job carries ttlSecondsAfterFinished, so
+# an hour after a run ends the pod and the only copy of its output are gone. The
+# engine is already streaming that output to drive progress, so it writes every
+# line to a claim in *this* cluster on the way past — that claim is the durable
+# record, and it is annotated helm.sh/resource-policy: keep so a `helm uninstall`
+# does not take a month of history with it.
+finetune_engine_log_store_enabled: true
+finetune_engine_log_store_size: 20Gi
+finetune_engine_log_store_retention_days: 30
+# Also archive each finished log to the Files API, so it lands in object storage
+# beside the model it produced. Posted to the in-cluster Service, not the gateway:
+# that route is OIDC-gated for browsers and its IP exemption names the GPU
+# cluster's egress rather than the engine pod's.
+finetune_engine_log_archive_enabled: true
+
+# ── GPU cluster (where training Jobs are created) ────────────────────────────
+# Defaults suit the B300 target. The kubeconfig path and namespace are
+# user-facing and normally set in finetune-config.cfg instead.
+finetune_engine_train_namespace: ftaas
+# Nodes training Jobs may run on. The NVIDIA GPU Operator sets this label; it
+# is also how local training finds out this cluster has GPUs.
+finetune_engine_train_node_selector: "nvidia.com/gpu.present=true"
+finetune_engine_train_kubeconfig_secret: finetune-train-kubeconfig
+finetune_engine_train_kubeconfig_mount: /etc/finetune/kubeconfig
+# Trainer image, pinned by digest. `unsloth/unsloth:latest` moves, and a library
+# bump inside it is an API break for the trainer — trl 0.24 dropped SFTTrainer
+# arguments the engine used to pass. This digest is the build validated on the
+# B300 (torch 2.11.0+cu128 / unsloth 2026.9.4 / trl 0.24.0).
+finetune_engine_train_image: "docker.io/unsloth/unsloth@sha256:970b6d2229ff6e22f85e26a50a269f66f8f3cb6929ea48b1cf1c251129e42412"
+# RWX claim shared by every training Job: dataset scratch, the merged model, and
+# the HuggingFace cache. RWX and warm matters — merging to 16-bit re-downloads
+# the original fp16 base weights, so a cold cache adds that download at the end
+# of every job, after training has already succeeded.
+finetune_engine_train_pvc: finetune-engine-work
+finetune_engine_train_pvc_size: 300Gi
+finetune_engine_train_pvc_storage_class: ceph-filesystem
+finetune_engine_train_gpu_count: 1
+finetune_engine_train_cpu_request: "8"
+finetune_engine_train_cpu_limit: "16"
+finetune_engine_train_memory_request: 48Gi
+finetune_engine_train_memory_limit: 96Gi
+
+# =============================================================================
+# Data Preparation Service Configuration
+# =============================================================================
+dataprep_name: data-prep-backend
+dataprep_replica_count: 1
+dataprep_image_repository: "{{ finetune_registry }}/data-prep-backend"
+dataprep_image_tag: latest
+dataprep_image_pull_policy: Always
+dataprep_service_port: "8000"
+dataprep_base_path: "{{ finetune_url_prefix }}"
+
+# Data Prep Resources
+dataprep_cpu_request: 500m
+dataprep_memory_request: 1Gi
+dataprep_cpu_limit: 2
+dataprep_memory_limit: 4Gi
+
+# Data Prep PostgreSQL Configuration
+dataprep_postgres_enabled: true
+dataprep_postgres_port: "5432"
+dataprep_postgres_database: dataprep
+dataprep_postgres_username: dataprep
+dataprep_postgres_storage_size: 10Gi
+dataprep_postgres_version: "15"
+
+# Data Prep Redis Configuration
+dataprep_redis_enabled: true
+dataprep_redis_port: "6379"
+dataprep_redis_storage_size: 2Gi
+
+# Data Prep MinIO Configuration
+dataprep_minio_bucket: dataprep
+
+# Namespace fine-tuned models (and the router's encoder) are served in, so the
+# MinIO read credentials their adapter fetch needs are provisioned here too. Its
+# own namespace, because it joins the mesh (see finetune_namespace_labels) so
+# LiteLLM and the object store accept its pods.
+finetune_inference_namespace: finetuning-models
+finetune_inference_minio_secret: minio-internal-creds
+
+# Serving: "Deploy Model" serves a job's LoRA adapter on its base model with
+# the platform's KServe (one LLMInferenceService per model), built from the
+# serving profile below, published to the inference namespace as a ConfigMap.
+# The defaults follow the platform's own vLLM models (Model Manager).
+finetune_serving_profile_configmap: finetuning-serving
+finetune_serving_image: docker.io/vllm/vllm-openai-cpu:v0.24.0
+finetune_serving_args:
+  - --dtype
+  - bfloat16
+  - --max-num-seqs
+  - "128"
+  - --max-num-batched-tokens
+  - "2048"
+  - --enable-prefix-caching
+  - --enable-chunked-prefill
+  # A model's full context (128K tokens for Llama 3.2) needs more KV cache than
+  # the default below reserves, and vLLM refuses to start. Editable per deploy.
+  - --max-model-len
+  - "32768"
+finetune_serving_env:
+  USER: vllm
+  VLLM_CPU_NUM_OF_RESERVED_CPU: "1"
+  VLLM_CPU_SGL_KERNEL: "1"
+  VLLM_NO_USAGE_STATS: "1"
+  KMP_BLOCKTIME: "1"
+# GiB of KV cache (VLLM_CPU_KVCACHE_SPACE), editable per deployment.
+finetune_serving_kv_cache_gib: 8
+# CPU placement, as the platform's models get it: the pod's vLLM container goes
+# into this NRI balloon, which gives it whole cores of its own.
+finetune_serving_balloon: vllm-balloon-tp1
+# Highest LoRA rank served; vLLM refuses an adapter above it.
+finetune_serving_max_lora_rank: 64
+# Where base models are kept between deployments (downloaded once each).
+finetune_model_store_claim: finetuning-model-store
+finetune_model_store_size: 200Gi
+# Blank: the cluster's default class.
+finetune_model_store_class: ""
+
+# This use case's routes on the platform gateway, sign-in included.
+finetune_routes_chart_path: "{{ finetune_plugin_path }}/helm-charts/gateway-routes"
+
+# Embedding model for the semantic router. LiteLLM's auto-router cannot be
+# created without one (auto_router_embedding_model is required), and it encodes
+# every routed request, so it stays resident. bge-base is small -- the cost is
+# the reservation below, not the model.
+finetune_embedding_enabled: true
+finetune_embedding_name: finetuning-embedding
+finetune_embedding_model: "BAAI/bge-base-en-v1.5"
+finetune_embedding_cpu: "4"
+finetune_embedding_memory: "8Gi"
+finetune_embedding_timeout: 900
+# 0 disables the count cap, which is the default: a count cannot tell a 1B model
+# from a 70B, so it refuses cheap deployments that would fit while permitting
+# expensive ones that will not. Admission is decided per request by the CPU and
+# memory check against real node capacity instead. Set a positive number only if
+# an installation needs a hard ceiling on how many vLLM instances exist at once
+# regardless of their size.
+finetune_deploy_max_models: 0
+
+# Celery Worker Configuration
+dataprep_celery_enabled: true
+dataprep_celery_replica_count: 1
+dataprep_celery_image_repository: "{{ finetune_registry }}/celery-worker"
+dataprep_celery_image_tag: latest
+# Docling converts on CPU (layout and table models), so cores decide how long
+# a document takes; each of the worker's concurrent tasks gets an equal share.
+dataprep_celery_concurrency: 2
+dataprep_celery_cpu_request: "2"
+dataprep_celery_memory_request: 4Gi
+dataprep_celery_cpu_limit: 8
+dataprep_celery_memory_limit: 16Gi
+
+# =============================================================================
+# Fine-Tuning UI Configuration
+# =============================================================================
+finetune_ui_name: finetuning-ui
+finetune_ui_replica_count: 1
+finetune_ui_image_repository: "{{ finetune_registry }}/finetuning-ui"
+finetune_ui_image_tag: latest
+finetune_ui_image_pull_policy: Always
+finetune_ui_service_port: "3000"
+finetune_ui_base_path: "{{ finetune_url_prefix }}/ui"
+
+# UI Resources
+finetune_ui_cpu_request: 250m
+finetune_ui_memory_request: 512Mi
+finetune_ui_cpu_limit: 1
+finetune_ui_memory_limit: 2Gi
+
+# =============================================================================
+# Shared MinIO Configuration
+# =============================================================================
+finetune_minio_enabled: "true"
+finetune_minio_service_name: minio
+finetune_minio_port: "9000"
+finetune_minio_console_port: 9001
+finetune_minio_storage_size: 50Gi
+finetune_minio_access_key: admin
+# finetune_minio_secret_key is resolved at deploy time (tasks/resolve-secrets.yml).
+finetune_minio_region: us-west-2
+finetune_minio_secure: "false"
+
+# =============================================================================
+# Source code paths
+# =============================================================================
+finetune_api_source_path: "{{ finetune_plugin_path }}/src/api"
+finetune_engine_source_path: "{{ finetune_plugin_path }}/src/engine"
+dataprep_source_path: "{{ finetune_plugin_path }}/src/dataprep"
+finetune_ui_source_path: "{{ finetune_plugin_path }}/src/ui"
+
+# =============================================================================
+# Autoscaling (disabled by default)
+# =============================================================================
+finetune_autoscaling_enabled: false
+finetune_autoscaling_min_replicas: 1
+finetune_autoscaling_max_replicas: 5
+finetune_autoscaling_target_cpu: 80
+finetune_autoscaling_target_memory: 80
+
+###########################################################################
+# Shared Keycloak (Toolkit Manager's keycloak role)
+#
+# Installed by Toolkit Manager through the Keycloak Operator and shared
+# with other use cases; this use case only creates and reconciles its own realm
+# in it. Served at the root of its own host (keycloak.<base domain>), not under
+# a path, and the public URL is read from the Keycloak CR at deploy time.
+###########################################################################
+keycloak_namespace: keycloak
+keycloak_cr_name: keycloak
+keycloak_statefulset: keycloak
+keycloak_service: keycloak-service
+keycloak_admin_secret: keycloak-admin-secret
+keycloak_relative_path: ""
+
+###########################################################################
+# Platform endpoints this use case consumes
+#
+# LiteLLM and Langfuse come from the inference layer (auth_type: litellm_vkey,
+# or litellm_enabled: true). The routes are published on the platform's Envoy
+# Gateway, which terminates TLS for <base domain> and *.<base domain>.
+###########################################################################
+toolkit_gateway_namespace: litellm
+litellm_master_key_secret: litellm-master-key
+litellm_deployment: litellm
+langfuse_keys_secret: langfuse-api-keys
+genai_gateway_url: http://litellm.litellm.svc.cluster.local:4000
+langfuse_url: http://langfuse-web.langfuse.svc.cluster.local:3000
+toolkit_hf_token_secret: hugging-face-token
+platform_gateway_name: eg-gateway
+platform_gateway_namespace: envoy-gateway-system
+platform_gateway_listener: https-apex
+
+# Istio ambient with mesh-wide STRICT mTLS: a pod outside the mesh is refused
+# by Keycloak and every other platform service, so each namespace this use
+# case creates joins it.
+finetune_namespace_labels:
+  istio.io/dataplane-mode: ambient
+
+# Secret holding the gateway master key, read by the Fine-Tuning API (model
+# registration, semantic routing).
+finetune_gateway_master_key_secret: genai-gateway-master-key
+
+# Where generated passwords are kept between runs. See tasks/resolve-secrets.yml.
+finetune_state_secret: finetuning-as-a-service-secrets
+finetune_state_namespace: "{{ finetune_api_namespace }}"

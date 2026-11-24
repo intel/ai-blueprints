@@ -1,0 +1,24 @@
+{{- /* Copyright (C) 2026 Intel Corporation */ -}}
+{{- /* SPDX-License-Identifier: Apache-2.0 */ -}}
+{{- range $b := list .Values.ui .Values.api .Values.dataprep }}
+{{- if ne $b.namespace $.Release.Namespace }}
+# Lets this use case's routes send traffic to {{ $b.service }}.
+apiVersion: gateway.networking.k8s.io/v1beta1
+kind: ReferenceGrant
+metadata:
+  name: finetuning-as-a-service-routes
+  namespace: {{ $b.namespace }}
+  labels:
+    {{- include "routes.labels" $ | nindent 4 }}
+spec:
+  from:
+    - group: gateway.networking.k8s.io
+      kind: HTTPRoute
+      namespace: {{ $.Release.Namespace }}
+  to:
+    - group: ""
+      kind: Service
+      name: {{ $b.service }}
+---
+{{- end }}
+{{- end }}
